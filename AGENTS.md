@@ -1,17 +1,16 @@
-# AGENTS.md — m1-dbc
+# AGENTS.md — m1-can
 
 Guidance for coding agents working in this repository.
 
 ## Purpose
 
-One job: turn a repo's MoTeC `.m1dbc` CAN databases into standard Vector `.dbc`
-files, and tell CI whether the committed exports are still in sync. It was
-extracted from `m1-project`, which keeps everything about editing
-`Project.m1prj` — including `validate`'s DBC checks. Nothing about `.m1prj`
-belongs here.
+Own the shared M1 CAN model. `inspect` combines `.m1dbc` messages with script
+`Init` calls and project/calibration values to reconstruct buses and classify
+ID reuse. `export` converts `.m1dbc` databases into standard Vector `.dbc`
+files and tells CI whether committed exports are in sync.
 
 The CLI contract (subcommand, flags, report text, exit codes) is a public API:
-the downstream pre-commit hook and the m1-ci gate call `m1-dbc export --check`
+the downstream pre-commit hook and the m1-ci gate call `m1-can export --check`
 and branch on its exit code, so changing any of it breaks them.
 
 ## Things that are deliberate (don't "fix" them)
@@ -54,9 +53,12 @@ and branch on its exit code, so changing any of it breaks them.
   findings"; **2** is a deliberate extension so a gate can tell a stale export
   (regenerate and commit) from a broken setup (fix the config) without parsing
   the report.
-- **The public API is three items** — `export`, `Outcome`, `ExportError`. The
-  four stage modules are private on purpose. Don't republish internals to make
-  a test easier; unit tests live inside the module they test.
+- **CAN answers are per bus, and never guessed.** Repeated IDs on different
+  resolved buses are safe; uninitialised or unresolved bindings are `unknown`.
+  Calibration-derived verdicts must retain their retune caveat.
+- **The export stage modules are private.** `inspect` and its serializable DTOs
+  are public deliberately: `m1-mcp` calls this crate in-process so CAN rules do
+  not fork between tools.
 
 ## Build / test gate
 
@@ -76,7 +78,7 @@ the regression signal.
 
 ## Dependencies and releases
 
-Depends on `m1-workspace` via a **versioned git tag** — never
+Depends on M1 toolchain crates via **versioned git tags** — never
 `branch`/`path`/`[patch]`; the repo must build exactly like a public clone.
 This is a binary repo: a version bump on `main` makes `release.yml` tag it and
 upload prebuilt binaries with build provenance attestations. m1-ci verifies that

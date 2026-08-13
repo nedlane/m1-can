@@ -1,4 +1,5 @@
-//! Read a MoTeC `.m1dbc` CAN database and emit a standard Vector `.dbc`.
+//! Inspect a MoTeC M1 project's CAN topology and export `.m1dbc` databases as
+//! standard Vector `.dbc` files.
 //!
 //! The crate is split by stage so each half is testable on its own:
 //! - `config` — read the `[dbc]` section of `m1-tools.toml`: which files a
@@ -12,17 +13,24 @@
 //!
 //! [`export`] is the entry point the `export` subcommand calls: it runs all four
 //! stages over every pair the repo declares, prints the report, and returns the
-//! [`Outcome`] that becomes the process exit code. Those three items are the
-//! whole public surface — the stage modules stay private, because the tool's
-//! contract is its CLI (report text and exit codes), not its internals.
+//! [`Outcome`] that becomes the process exit code. The export stage modules stay
+//! private; CAN inspection is also exposed as a library API so `m1-mcp` and
+//! other consumers share exactly the same bus-binding and overlap rules.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+mod can;
 mod config;
+mod loader;
 mod m1dbc;
 mod roundtrip;
 mod writer;
+
+pub use can::{
+    CanIdOverlapDto, CanInitDto, CanMessageDto, CanModuleDto, CanOutcome, CanOverlapMemberDto,
+    inspect,
+};
 
 /// How an export run ended — the CLI's exit-code contract.
 ///
@@ -256,7 +264,7 @@ fn export_pair(pair: &Pair<'_>) -> Result<Outcome, String> {
             println!("  {:<16}: yes", "in sync");
         } else {
             println!(
-                "  !! {} is out of sync with {} — run: m1-dbc export",
+                "  !! {} is out of sync with {} — run: m1-can export",
                 relative(pair.out, pair.root),
                 relative(pair.src, pair.root)
             );
@@ -284,7 +292,7 @@ fn write_export(path: &Path, text: &str) -> Result<(), String> {
 /// A fresh directory under the system temp dir for one `--check` run.
 fn scratch_dir() -> Result<PathBuf, String> {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("m1-dbc-export-{}", std::process::id()));
+    dir.push(format!("m1-can-export-{}", std::process::id()));
     // Left over from a crashed run with the same pid: start from nothing so a
     // stale file can never be read back as this run's output.
     let _ = std::fs::remove_dir_all(&dir);

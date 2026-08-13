@@ -1,4 +1,4 @@
-//! `m1-dbc export` end-to-end: config discovery, generation, and `--check`
+//! `m1-can export` end-to-end: config discovery, generation, and `--check`
 //! drift.
 //!
 //! Every test builds a throwaway repo under the system temp dir — an
@@ -42,14 +42,14 @@ fn sample_repo(name: &str) -> PathBuf {
     root
 }
 
-/// Run `m1-dbc export [args]` with `dir` as the working directory.
+/// Run `m1-can export [args]` with `dir` as the working directory.
 fn export_dbc(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_m1-dbc"))
+    Command::new(env!("CARGO_BIN_EXE_m1-can"))
         .arg("export")
         .args(args)
         .current_dir(dir)
         .output()
-        .expect("run m1-dbc")
+        .expect("run m1-can")
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn generation_writes_the_export_and_reports_the_counts() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "m1-dbc export failed: {}\n{stdout}",
+        "m1-can export failed: {}\n{stdout}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -136,7 +136,7 @@ fn check_fails_when_the_committed_export_drifts() {
         "a drifted export must exit 1, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("is out of sync with") && stdout.contains("m1-dbc export"),
+        stdout.contains("is out of sync with") && stdout.contains("m1-can export"),
         "the drift line must name both files and the fix, got:\n{stdout}"
     );
     // --check must never touch the working tree, drift or not.
@@ -237,7 +237,7 @@ fn runs_from_a_subdirectory_of_the_repo() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "m1-dbc export from a subdirectory failed: {}\n{stdout}",
+        "m1-can export from a subdirectory failed: {}\n{stdout}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(

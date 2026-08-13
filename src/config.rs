@@ -22,7 +22,7 @@
 //!
 //! Discovery goes through [`M1ToolsConfig::discover_result`], the same walk-up
 //! every other M1 tool uses, so "which `m1-tools.toml` governs this directory"
-//! can never drift between `m1-dbc`, `m1-project`, `m1-fmt`, `m1-lint` and the
+//! can never drift between `m1-can`, `m1-project`, `m1-fmt`, `m1-lint` and the
 //! LSP. That call parses the file into the *shared* schema, which has no `[dbc]`
 //! section and discards it. This module therefore re-reads the discovered path
 //! and parses `[dbc]` out of it directly. Adding the section to `M1ToolsConfig`
@@ -366,7 +366,7 @@ out_dir = "dbc"
     ///
     /// The walk climbs `parent()`s lexically, so an un-absolutised relative path
     /// exhausts its components at the working directory and the search stops
-    /// there — `m1-dbc export` run from `dbc/` inside a repo would miss the
+    /// there — `m1-can export` run from `dbc/` inside a repo would miss the
     /// `m1-tools.toml` above it and print "nothing to export".
     ///
     /// The truncation itself cannot be reproduced without a working directory

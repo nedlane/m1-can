@@ -1,6 +1,6 @@
 name: Release binaries
 
-# Publishes the m1-dbc CLI as prebuilt binaries (Linux/macOS/Windows) on a
+# Publishes the m1-can CLI as prebuilt binaries (Linux/macOS/Windows) on a
 # GitHub Release named after the crate version. m1-ci downloads these to run the
 # M1 toolchain without building from source, and it verifies each download's
 # build provenance with `gh attestation verify` — so a binary must be produced
@@ -40,7 +40,7 @@ jobs:
           # of the per-platform binaries. Keying only on "release exists" meant a
           # release tagged before its binaries uploaded (or created by hand) could
           # never self-heal — the consumers would be left with a 404.
-          required="m1-dbc-x86_64-unknown-linux-gnu m1-dbc-aarch64-apple-darwin m1-dbc-x86_64-pc-windows-msvc.exe"
+          required="m1-can-x86_64-unknown-linux-gnu m1-can-aarch64-apple-darwin m1-can-x86_64-pc-windows-msvc.exe"
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             assets=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
             missing=
@@ -90,13 +90,13 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin m1-dbc
+        run: cargo build --release --target ${{ matrix.target }} --bin m1-can
       - name: Stage binary
         shell: bash
         run: |
           mkdir -p out
-          cp "target/${{ matrix.target }}/release/m1-dbc${{ matrix.ext }}" \
-             "out/m1-dbc-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release/m1-can${{ matrix.ext }}" \
+             "out/m1-can-${{ matrix.target }}${{ matrix.ext }}"
       - name: Ad-hoc re-sign the macOS binary
         if: runner.os == 'macOS'
         shell: bash
@@ -107,8 +107,8 @@ jobs:
           # pre-commit hook) fails before the tool starts. A fresh ad-hoc re-sign
           # writes a valid signature over the final bytes; the artifact zip
           # round-trip preserves it to the user. (nvim-m1#15)
-          codesign --force --sign - "out/m1-dbc-${{ matrix.target }}${{ matrix.ext }}"
-          codesign --verify --verbose "out/m1-dbc-${{ matrix.target }}${{ matrix.ext }}"
+          codesign --force --sign - "out/m1-can-${{ matrix.target }}${{ matrix.ext }}"
+          codesign --verify --verbose "out/m1-can-${{ matrix.target }}${{ matrix.ext }}"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
@@ -147,15 +147,15 @@ jobs:
 
           ## Install
 
-          Prebuilt binaries of the **m1-dbc** CLI, which exports MoTeC `.m1dbc` CAN databases as Vector `.dbc` files. Downloaded automatically by m1-ci; manual install:
+          Prebuilt binaries of the **m1-can** CLI, which exports MoTeC `.m1dbc` CAN databases as Vector `.dbc` files. Downloaded automatically by m1-ci; manual install:
 
           | Platform | Asset |
           | --- | --- |
-          | Linux x86_64 | [`m1-dbc-x86_64-unknown-linux-gnu`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-dbc-x86_64-unknown-linux-gnu) |
-          | macOS Apple Silicon | [`m1-dbc-aarch64-apple-darwin`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-dbc-aarch64-apple-darwin) |
-          | Windows x86_64 | [`m1-dbc-x86_64-pc-windows-msvc.exe`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-dbc-x86_64-pc-windows-msvc.exe) |
+          | Linux x86_64 | [`m1-can-x86_64-unknown-linux-gnu`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-can-x86_64-unknown-linux-gnu) |
+          | macOS Apple Silicon | [`m1-can-aarch64-apple-darwin`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-can-aarch64-apple-darwin) |
+          | Windows x86_64 | [`m1-can-x86_64-pc-windows-msvc.exe`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-can-x86_64-pc-windows-msvc.exe) |
 
-          Download the binary for your platform, rename it to `m1-dbc` (`m1-dbc.exe` on Windows), mark it executable (`chmod +x m1-dbc`), and move it onto your `PATH`. On macOS, clear the download quarantine first: `xattr -d com.apple.quarantine m1-dbc`.
+          Download the binary for your platform, rename it to `m1-can` (`m1-can.exe` on Windows), mark it executable (`chmod +x m1-can`), and move it onto your `PATH`. On macOS, clear the download quarantine first: `xattr -d com.apple.quarantine m1-can`.
 
           Or build from source on any platform (incl. Intel macOS):
 
@@ -169,7 +169,7 @@ jobs:
 
           ```sh
           sha256sum --check --ignore-missing SHA256SUMS
-          gh attestation verify m1-dbc-x86_64-unknown-linux-gnu --repo {{REPO}}
+          gh attestation verify m1-can-x86_64-unknown-linux-gnu --repo {{REPO}}
           ```
           NOTES
           sed -i "s|{{REPO}}|$GITHUB_REPOSITORY|g; s|{{TAG}}|$TAG|g" body.md
@@ -182,6 +182,6 @@ jobs:
           else
             gh release create "$TAG" out/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "m1-dbc $TAG" \
+              --title "m1-can $TAG" \
               --notes-file body.md
           fi
