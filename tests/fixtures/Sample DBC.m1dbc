@@ -1,0 +1,27 @@
+<ComponentStream>
+  <List>
+    <Component Classname="BuiltIn.CAN.DBC" Name="Sample DBC">
+      <Props/>
+    </Component>
+    <Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Status" Sender="ECU">
+      <Props CANId="3FD" IdType="Standard" DLC="8"/>
+    </Component>
+    <Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.Status.Yaw Rate">
+      <Props StartBit="0" Length="10" Type="s16" Multiplier="0.5" Offset="-100">
+        <Locale><Default Unit="°/s"/></Locale>
+      </Props>
+    </Component>
+    <Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.Status.Ready">
+      <Props StartBit="A" Type="bool"/>
+    </Component>
+    <Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.VECTOR INDEPENDENT SIG MSG">
+      <Props CANId="40000000" DLC="8"/>
+    </Component>
+    <Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.VECTOR INDEPENDENT SIG MSG.Orphan">
+      <Props StartBit="0" Length="8"/>
+    </Component>
+    <Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.No Id">
+      <Props DLC="8"/>
+    </Component>
+  </List>
+</ComponentStream>
