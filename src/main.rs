@@ -1,16 +1,14 @@
-//! `m1-dbc` CLI: export a repo's MoTeC `.m1dbc` CAN databases as standard
-//! Vector `.dbc` files, and verify the committed exports are up to date.
-//!
-//! The whole tool is one verb today, but it is a *subcommand* rather than a bare
-//! flag so the binary can grow a second one (an inspect/diff verb, say) without
-//! breaking the pre-commit hooks that already call `m1-dbc export --check`.
+//! `m1-can` CLI: export a repo's MoTeC `.m1dbc` CAN databases as standard
+//! Vector `.dbc` files, verify committed exports, and inspect the bus topology
+//! created by `DBC.<Name>.Init(<bus>)` calls.
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
-    name = "m1-dbc",
-    about = "Export MoTeC M1 .m1dbc CAN databases as standard Vector .dbc files",
+    name = "m1-can",
+    about = "Inspect MoTeC M1 CAN topology and export .m1dbc databases as Vector .dbc files",
     version
 )]
 struct Cli {
@@ -20,6 +18,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect DBC module bus bindings, messages, and repeated CAN identifiers.
+    Inspect {
+        /// Path to the project's `Project.m1prj`.
+        #[arg(long)]
+        project: PathBuf,
+        /// Return only messages whose symbol path contains this text.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Maximum messages returned; zero means no limit.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     /// Export the repo's MoTeC `.m1dbc` CAN databases as standard Vector `.dbc`
     /// files.
     ///
@@ -63,13 +73,22 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }
 
 fn run(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     match &cli.command {
+        Command::Inspect {
+            project,
+            filter,
+            limit,
+        } => {
+            let outcome = m1_can::inspect(project, filter.as_deref(), *limit)?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Export { check } => {
             // The working directory is the input: the `[dbc]` section is found by
             // walking up from it, so the verb works from anywhere in the repo.
@@ -77,7 +96,7 @@ fn run(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .map_err(|e| format!("cannot determine the working directory: {e}"))?;
             // 2 (a config/IO/parse failure) has to be returned, not raised: main's
             // catch-all maps every Err to 1, which is the "stale export" code.
-            Ok(ExitCode::from(m1_dbc::export(&cwd, *check).code()))
+            Ok(ExitCode::from(m1_can::export(&cwd, *check).code()))
         }
     }
 }
