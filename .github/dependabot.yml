@@ -12,3 +12,8 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+    ignore:
+      # The MSRV job pins this action to the same toolchain as Cargo.toml's
+      # rust-version, and the two only ever move together. A lone bump here
+      # fails the job it is meant to run.
+      - dependency-name: "dtolnay/rust-toolchain"
