@@ -1,0 +1,31 @@
+[package]
+name = "m1-dbc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Export MoTeC M1 .m1dbc CAN databases as standard Vector .dbc files, and verify the committed exports are in sync"
+repository = "https://github.com/C-Nucifora/m1-dbc"
+publish = false
+
+[[bin]]
+name = "m1-dbc"
+path = "src/main.rs"
+
+[lib]
+name = "m1_dbc"
+path = "src/lib.rs"
+
+[dependencies]
+can-dbc = { version = "10", default-features = false }
+clap = { version = "4", features = ["derive"] }
+roxmltree = "0.21"
+# Reading the `[dbc]` section of `m1-tools.toml` only (src/config.rs).
+# m1-workspace already pulls `toml` 1.x with default features into the lockfile,
+# so naming it here adds no crate to the dependency graph. The crate's no-serde
+# stance is unchanged: `[dbc]` is navigated as a `toml::Table`, never derived.
+toml = "1"
+m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.13.0" }
+
+[profile.release]
+opt-level = 3
