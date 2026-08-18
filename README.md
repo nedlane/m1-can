@@ -16,9 +16,8 @@ It is one of the M1 toolchain's sibling CLIs, alongside
 [m1-fmt](https://github.com/C-Nucifora/m1-fmt),
 [m1-lint](https://github.com/C-Nucifora/m1-lint),
 [m1-typecheck](https://github.com/C-Nucifora/m1-typecheck) and
-[m1-project](https://github.com/nedlane/m1-project). The export implementation
-originated in `m1-dbc`; the inspection implementation originated in `m1-mcp`.
-They live together here so every consumer uses one CAN model.
+[m1-project](https://github.com/nedlane/m1-project). Export and inspection live
+together here so every consumer uses one CAN model.
 
 ## Install
 
