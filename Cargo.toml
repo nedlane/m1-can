@@ -30,7 +30,7 @@ serde_json = "1"
 toml = "1"
 m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.13.0" }
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.0" }
-m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.49.0" }
+m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.49.1" }
 
 [dev-dependencies]
 tempfile = "3"
