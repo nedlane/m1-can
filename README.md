@@ -44,6 +44,11 @@ already loaded the project and scripts can call `inspect_loaded` so its load
 report and CAN verdicts use one snapshot. The result lists scripts skipped from
 `Init` analysis because of syntax errors or excessive nesting.
 
+Evaluators can call `runtime_model_loaded` with that same project/script
+snapshot and borrowed `.m1dbc` bytes. It preserves exact M1 paths, aliases, and
+DBC bit layout while performing no filesystem reads; the supplied bytes are the
+authoritative layout snapshot.
+
 ## CAN topology and overlap verdicts
 
 CAN identifiers are scoped to a bus. Two modules may legitimately reuse an ID
