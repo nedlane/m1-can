@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use m1_core::{Kind, Node};
+use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::project::Project;
 use m1_typecheck::symbols::{CanDirection, SymbolKind};
 use m1_typecheck::typer::path_text;
@@ -28,7 +29,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Guidance returned with every response, so the rule travels with the data.
-const GUIDANCE: [&str; 6] = [
+const GUIDANCE: [&str; 7] = [
     "`.m1dbc` files store `CANId` (and the other integer attributes) in HEXADECIMAL without a \
      prefix — `CANId=\"133\"` is 0x133 = 307, not decimal 133. `can_id` here is the correctly \
      parsed number and `can_id_hex` matches the file's own spelling; never re-read the raw XML \
@@ -47,6 +48,9 @@ const GUIDANCE: [&str; 6] = [
     "`depends_on_calibration: true` means the verdict rests on a parameter's value in \
      `parameters.m1cfg`: it holds for this calibration, and a retune can change it. Verdicts from \
      literals and constants alone are retune-proof.",
+    "A non-empty `skipped_scripts` list means some scripts could not safely contribute their \
+     `DBC.<Name>.Init(...)` calls. Treat module bus bindings and overlap verdicts as incomplete \
+     until those scripts are fixed.",
 ];
 /// How a module's bus argument was classified.
 fn bus_kind_str(k: SymbolKind) -> &'static str {
@@ -184,6 +188,15 @@ pub struct CanIdOverlapDto {
     pub messages: Vec<CanOverlapMemberDto>,
 }
 
+/// A script whose `DBC.<Name>.Init(...)` calls could not be inspected safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CanSkippedScriptDto {
+    /// Script name from the loaded project snapshot.
+    pub script: String,
+    /// Why the script was excluded from CAN bus-binding analysis.
+    pub reason: String,
+}
+
 /// The CAN picture for one project.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CanOutcome {
@@ -197,6 +210,9 @@ pub struct CanOutcome {
     pub messages: Vec<CanMessageDto>,
     /// Total messages in the project, before `filter`/`limit`.
     pub total_messages: usize,
+    /// Scripts excluded from `Init`-call analysis because their syntax or
+    /// nesting made their reference shapes unsafe to inspect.
+    pub skipped_scripts: Vec<CanSkippedScriptDto>,
     /// How to read all of the above — the bus rule, restated.
     pub guidance: Vec<String>,
 }
@@ -408,7 +424,19 @@ pub fn inspect(
     crate::loader::check_project_script_budget(project_path)?;
     let project = crate::loader::load_project_full(project_path)?;
     let scripts = crate::loader::gather_project_scripts(project_path);
+    Ok(inspect_loaded(&project, &scripts, filter, limit))
+}
 
+/// Build the CAN picture from one already-loaded project and parsed script
+/// snapshot. This is the entry point for consumers that attach their own load
+/// report, since the returned verdicts and that report can then describe the
+/// same loaded snapshot instead of two independent loads.
+pub fn inspect_loaded(
+    project: &Project,
+    scripts: &[ParsedScript],
+    filter: Option<&str>,
+    limit: usize,
+) -> CanOutcome {
     // Registered DBC objects. A DBC appears twice — `DBC.<Name>` from the
     // `.m1prj` and bare `<Name>` from the `.m1dbc` — so unify by leaf name while
     // keeping every spelling for the `Init`-call match.
@@ -427,20 +455,51 @@ pub fn inspect(
     let leaves: BTreeSet<String> = dbc_paths.iter().map(|p| leaf(p).to_string()).collect();
 
     // `Init` call sites, keyed by module leaf.
-    let resolve_bus = |arg: &str| classify_bus(arg, &project);
+    let resolve_bus = |arg: &str| classify_bus(arg, project);
     let mut init_by_module: BTreeMap<String, Vec<CanInitDto>> = BTreeMap::new();
-    for s in &scripts {
-        // An unparseable script's reference shapes are unreliable — skip it,
-        // like the T107 pass does.
-        if !s.cst.syntax_diagnostics().is_empty() {
+    let mut skipped_scripts = Vec::new();
+    for s in scripts {
+        // An unparseable script's reference shapes are unreliable. Keep the
+        // omission visible rather than presenting its missing Init calls as a
+        // clean uninitialised-module result.
+        let syntax = s.cst.syntax_diagnostics();
+        if let Some(first) = syntax.first() {
+            let noun = if syntax.len() == 1 {
+                "syntax diagnostic"
+            } else {
+                "syntax diagnostics"
+            };
+            skipped_scripts.push(CanSkippedScriptDto {
+                script: s.name.clone(),
+                reason: format!(
+                    "{} {noun}; first at line {}, column {}: {}; Init calls were not inspected",
+                    syntax.len(),
+                    first.range.start.line + 1,
+                    first.range.start.column + 1,
+                    first.message,
+                ),
+            });
+            continue;
+        }
+        let root = s.cst.root();
+        let depth = root.max_depth();
+        if depth > m1_core::MAX_RECURSION_DEPTH {
+            skipped_scripts.push(CanSkippedScriptDto {
+                script: s.name.clone(),
+                reason: format!(
+                    "nesting depth {depth} exceeds the safe limit {}; Init calls were not inspected",
+                    m1_core::MAX_RECURSION_DEPTH,
+                ),
+            });
             continue;
         }
         let mut found = Vec::new();
-        collect_init_calls(s.cst.root(), &dbc_paths, &s.name, &resolve_bus, &mut found);
+        collect_init_calls(root, &dbc_paths, &s.name, &resolve_bus, &mut found);
         for (module, call) in found {
             init_by_module.entry(module).or_default().push(call);
         }
     }
+    skipped_scripts.sort_by(|a, b| a.script.cmp(&b.script));
 
     // Resolve each module's bus: one agreed argument, or none.
     let mut modules: Vec<CanModuleDto> = Vec::new();
@@ -533,7 +592,7 @@ pub fn inspect(
         messages.truncate(limit);
     }
 
-    Ok(CanOutcome {
+    CanOutcome {
         modules,
         uninitialised_modules: leaves
             .iter()
@@ -543,8 +602,9 @@ pub fn inspect(
         id_overlaps,
         messages,
         total_messages,
+        skipped_scripts,
         guidance: GUIDANCE.iter().map(|g| g.to_string()).collect(),
-    })
+    }
 }
 
 /// Group messages by CAN id and judge each repeated id against the buses its
