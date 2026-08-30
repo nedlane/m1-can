@@ -96,10 +96,13 @@ BO_ 3221225472 VECTOR__INDEPENDENT_SIG_MSG: 0 Vector__XXX
     /// unsigned, unit-less, no named receiver.
     fn float_signal(name: &str, start_bit: u16, length: u16) -> M1Signal {
         M1Signal {
+            source_path: format!("Test.Floats.{name}"),
             name: name.to_string(),
+            raw_type: if length == 64 { "f64" } else { "f32" }.to_string(),
             start_bit,
             length,
             little_endian: true,
+            endian: "Little".to_string(),
             is_signed: false,
             is_float: true,
             scale: 1.0,
@@ -117,17 +120,23 @@ BO_ 3221225472 VECTOR__INDEPENDENT_SIG_MSG: 0 Vector__XXX
     #[test]
     fn an_extended_frame_carrying_ieee_floats_reads_back_intact() {
         let file = M1DbcFile {
+            module_paths: vec!["Test".to_string()],
             messages: vec![M1Message {
+                source_path: "Test.Floats".to_string(),
                 name: "Floats".to_string(),
                 frame_id: 0x18FF_50E5,
                 is_extended: true,
+                id_type: "Extended".to_string(),
                 dlc: 8,
+                direction: None,
                 sender: "Vector__XXX".to_string(),
                 signals: vec![
                     float_signal("Single", 0, 32),
                     float_signal("Double", 32, 64),
                 ],
             }],
+            orphan_signal_paths: Vec::new(),
+            duplicate_message_paths: Vec::new(),
             skipped: Vec::new(),
             totals: SourceCounts {
                 total_messages: 1,
