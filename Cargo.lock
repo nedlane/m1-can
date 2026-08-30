@@ -252,7 +252,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "m1-can"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "can-dbc",
  "clap",
@@ -278,8 +278,8 @@ dependencies = [
 
 [[package]]
 name = "m1-typecheck"
-version = "0.50.0"
-source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.50.0#d08d0fc77aa939d25aae243d68d4752500265f13"
+version = "0.51.0"
+source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.51.0#e79bd0e4686cae078b1f96a728f2f94affc3ede4"
 dependencies = [
  "clap",
  "m1-core",
