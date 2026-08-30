@@ -118,6 +118,120 @@ fn can_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, project)
 }
 
+fn load_can_snapshot(
+    project_path: &std::path::Path,
+) -> (
+    m1_typecheck::project::Project,
+    Vec<m1_typecheck::parsed::ParsedScript>,
+) {
+    let root = project_path.parent().unwrap();
+    let mut project = m1_typecheck::project::Project::load(project_path).unwrap();
+    if let Some(config) = m1_workspace::find_config_file(root) {
+        project = project.with_config(&config).unwrap();
+    }
+    for dbc in m1_workspace::find_dbc_files(root) {
+        let relative = dbc.strip_prefix(root).unwrap().to_string_lossy();
+        project.augment_dbc(&dbc, &relative).unwrap();
+    }
+    let sources: Vec<(String, String)> = m1_workspace::find_scripts(root)
+        .into_iter()
+        .map(|script| {
+            (
+                script.file_name().unwrap().to_string_lossy().into_owned(),
+                m1_workspace::read_text(&script).unwrap(),
+            )
+        })
+        .collect();
+    let scripts = m1_typecheck::parsed::parse_all(&sources);
+    (project, scripts)
+}
+
+#[test]
+fn can_loaded_snapshot_does_not_reread_project_files() {
+    let (_dir, project_path) = can_fixture();
+    let (project, scripts) = load_can_snapshot(&project_path);
+
+    std::fs::write(
+        project_path
+            .parent()
+            .unwrap()
+            .join("Scripts/CAN.CAN Init.m1scr"),
+        "DBC.Alpha.Init(9);\n",
+    )
+    .unwrap();
+
+    let out = m1_can::inspect_loaded(&project, &scripts, None, 200);
+    let alpha = out
+        .modules
+        .iter()
+        .find(|module| module.name == "Alpha")
+        .unwrap();
+    assert_eq!(alpha.bus.as_deref(), Some("1"));
+    assert!(out.skipped_scripts.is_empty());
+}
+
+#[test]
+fn can_names_a_syntax_error_script_skipped_from_init_analysis() {
+    let (_dir, project_path) = can_fixture();
+    std::fs::write(
+        project_path
+            .parent()
+            .unwrap()
+            .join("Scripts/CAN.CAN Init.m1scr"),
+        "DBC.Alpha.Init(1);\nlocal x = ;\n",
+    )
+    .unwrap();
+    let (project, scripts) = load_can_snapshot(&project_path);
+
+    let out = m1_can::inspect_loaded(&project, &scripts, None, 200);
+    let alpha = out
+        .modules
+        .iter()
+        .find(|module| module.name == "Alpha")
+        .unwrap();
+    assert!(
+        !alpha.initialised,
+        "the unsafe script must not supply a bus binding"
+    );
+    assert_eq!(out.skipped_scripts.len(), 1);
+    let skipped = &out.skipped_scripts[0];
+    assert_eq!(skipped.script, "CAN.CAN Init.m1scr");
+    assert!(
+        skipped.reason.contains("syntax diagnostic"),
+        "{}",
+        skipped.reason
+    );
+    assert!(skipped.reason.contains("Init calls were not inspected"));
+}
+
+#[test]
+fn can_names_an_excessively_deep_script_skipped_from_init_analysis() {
+    let (_dir, project_path) = can_fixture();
+    let depth = m1_core::MAX_RECURSION_DEPTH + 100;
+    let source = format!(
+        "DBC.Alpha.Init(1);\nlocal x = {}1{};\n",
+        "(".repeat(depth),
+        ")".repeat(depth),
+    );
+    std::fs::write(
+        project_path
+            .parent()
+            .unwrap()
+            .join("Scripts/CAN.CAN Init.m1scr"),
+        source,
+    )
+    .unwrap();
+    let (project, scripts) = load_can_snapshot(&project_path);
+
+    let out = m1_can::inspect_loaded(&project, &scripts, None, 200);
+    assert_eq!(out.skipped_scripts.len(), 1);
+    assert!(
+        out.skipped_scripts[0].reason.contains("nesting depth"),
+        "{}",
+        out.skipped_scripts[0].reason,
+    );
+}
+
 #[test]
 fn can_binds_each_dbc_module_to_the_bus_its_init_call_names() {
     let (_dir, project) = can_fixture();
