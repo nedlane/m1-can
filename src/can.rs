@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use m1_core::{Kind, Node};
+use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::project::Project;
 use m1_typecheck::symbols::{CanDirection, SymbolKind};
 use m1_typecheck::typer::path_text;
@@ -28,7 +29,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Guidance returned with every response, so the rule travels with the data.
-const GUIDANCE: [&str; 6] = [
+const GUIDANCE: [&str; 7] = [
     "`.m1dbc` files store `CANId` (and the other integer attributes) in HEXADECIMAL without a \
      prefix — `CANId=\"133\"` is 0x133 = 307, not decimal 133. `can_id` here is the correctly \
      parsed number and `can_id_hex` matches the file's own spelling; never re-read the raw XML \
@@ -47,6 +48,9 @@ const GUIDANCE: [&str; 6] = [
     "`depends_on_calibration: true` means the verdict rests on a parameter's value in \
      `parameters.m1cfg`: it holds for this calibration, and a retune can change it. Verdicts from \
      literals and constants alone are retune-proof.",
+    "A non-empty `skipped_scripts` list means some scripts could not safely contribute their \
+     `DBC.<Name>.Init(...)` calls. Treat module bus bindings and overlap verdicts as incomplete \
+     until those scripts are fixed.",
 ];
 /// How a module's bus argument was classified.
 fn bus_kind_str(k: SymbolKind) -> &'static str {
@@ -184,6 +188,15 @@ pub struct CanIdOverlapDto {
     pub messages: Vec<CanOverlapMemberDto>,
 }
 
+/// A script whose `DBC.<Name>.Init(...)` calls could not be inspected safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CanSkippedScriptDto {
+    /// Script name from the loaded project snapshot.
+    pub script: String,
+    /// Why the script was excluded from CAN bus-binding analysis.
+    pub reason: String,
+}
+
 /// The CAN picture for one project.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CanOutcome {
@@ -197,6 +210,9 @@ pub struct CanOutcome {
     pub messages: Vec<CanMessageDto>,
     /// Total messages in the project, before `filter`/`limit`.
     pub total_messages: usize,
+    /// Scripts excluded from `Init`-call analysis because their syntax or
+    /// nesting made their reference shapes unsafe to inspect.
+    pub skipped_scripts: Vec<CanSkippedScriptDto>,
     /// How to read all of the above — the bus rule, restated.
     pub guidance: Vec<String>,
 }
@@ -265,7 +281,8 @@ fn leaf(path: &str) -> &str {
     path.rsplit('.').next().unwrap_or(path)
 }
 
-/// Walk a script for `<dbc>.Init(<bus>)` calls, pushing `(module_leaf, call)`.
+/// Walk a script for `<dbc>.Init(<bus>)` calls, pushing the exact registered
+/// DBC path and call. Callers decide how aliases map onto one module identity.
 fn collect_init_calls(
     n: Node,
     dbc_paths: &[String],
@@ -292,7 +309,7 @@ fn collect_init_calls(
                 .unwrap_or_default();
             let arg = resolve_bus(&bus);
             out.push((
-                leaf(obj).to_string(),
+                obj.to_string(),
                 CanInitDto {
                     script: script.to_string(),
                     line: n.range().start.line + 1,
@@ -382,6 +399,111 @@ fn classify_bus(arg: &str, project: &Project) -> BusArg {
     }
 }
 
+/// Exact DBC symbol paths registered in the loaded project. A normal loaded
+/// project contains both the `.m1prj` spelling (`DBC.BMU`) and the source DBC
+/// spelling (`BMU`); keeping both is necessary for script alias resolution.
+pub(crate) fn registered_dbc_paths(project: &Project) -> Vec<String> {
+    let mut paths: Vec<String> = project
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.classname.as_deref() == Some("BuiltIn.CAN.DBC"))
+        .map(|symbol| symbol.path.clone())
+        .collect();
+    paths.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    paths.dedup();
+    paths
+}
+
+/// Resolve every usable script's DBC Init calls against one caller-owned
+/// project/script snapshot. The path paired with each call is the exact alias
+/// that appeared before `.Init`, not a leaf-name approximation.
+pub(crate) fn loaded_init_calls(
+    project: &Project,
+    scripts: &[ParsedScript],
+) -> (Vec<(String, CanInitDto)>, Vec<CanSkippedScriptDto>) {
+    let dbc_paths = registered_dbc_paths(project);
+    loaded_init_calls_for_paths(project, scripts, &dbc_paths)
+}
+
+/// Resolve Init calls against an explicit set of exact DBC aliases. The runtime
+/// model adds source-root paths to the project registrations so caller-owned
+/// DBC bytes remain usable without first augmenting the [`Project`].
+pub(crate) fn loaded_init_calls_for_paths(
+    project: &Project,
+    scripts: &[ParsedScript],
+    dbc_paths: &[String],
+) -> (Vec<(String, CanInitDto)>, Vec<CanSkippedScriptDto>) {
+    // Longest first ensures `DBC.Dash.Init` is matched before `Dash.Init`.
+    let mut dbc_paths = dbc_paths.to_vec();
+    dbc_paths.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    dbc_paths.dedup();
+    let resolve_bus = |arg: &str| classify_bus(arg, project);
+    let mut found = Vec::new();
+    let mut skipped_scripts = Vec::new();
+    for script in scripts {
+        // An unparseable script's reference shapes are unreliable. Keep the
+        // omission visible rather than presenting its missing Init calls as a
+        // clean uninitialised-module result.
+        let syntax = script.cst.syntax_diagnostics();
+        if let Some(first) = syntax.first() {
+            let noun = if syntax.len() == 1 {
+                "syntax diagnostic"
+            } else {
+                "syntax diagnostics"
+            };
+            skipped_scripts.push(CanSkippedScriptDto {
+                script: script.name.clone(),
+                reason: format!(
+                    "{} {noun}; first at line {}, column {}: {}; Init calls were not inspected",
+                    syntax.len(),
+                    first.range.start.line + 1,
+                    first.range.start.column + 1,
+                    first.message,
+                ),
+            });
+            continue;
+        }
+        let root = script.cst.root();
+        let depth = root.max_depth();
+        if depth > m1_core::MAX_RECURSION_DEPTH {
+            skipped_scripts.push(CanSkippedScriptDto {
+                script: script.name.clone(),
+                reason: format!(
+                    "nesting depth {depth} exceeds the safe limit {}; Init calls were not inspected",
+                    m1_core::MAX_RECURSION_DEPTH,
+                ),
+            });
+            continue;
+        }
+        collect_init_calls(root, &dbc_paths, &script.name, &resolve_bus, &mut found);
+    }
+    skipped_scripts.sort_by(|a, b| a.script.cmp(&b.script));
+    (found, skipped_scripts)
+}
+
+/// module -> (bus argument, kind, resolved number, calibration-sourced)
+pub(crate) type BusBinding = (Option<String>, String, Option<i64>, bool);
+
+/// Collapse one module's Init calls into its single usable bus binding. Calls
+/// that disagree keep the module initialised but deliberately unbound.
+pub(crate) fn binding_from_calls(calls: &[CanInitDto]) -> BusBinding {
+    let distinct: BTreeSet<&str> = calls.iter().map(|call| call.bus.as_str()).collect();
+    match distinct.len() {
+        0 => (None, "none".to_string(), None, false),
+        1 => {
+            let call = &calls[0];
+            (
+                Some(call.bus.clone()),
+                call.bus_kind.clone(),
+                call.bus_value,
+                call.bus_calibrated,
+            )
+        }
+        // Disagreeing `Init` calls: no single bus can be assumed.
+        _ => (None, "conflicting-init".to_string(), None, false),
+    }
+}
+
 /// Turn a recorded bus argument back into a comparable [`Bus`].
 fn bus_of(bus: &str, kind: &str, value: Option<i64>, calibrated: bool) -> Option<Bus> {
     if bus.is_empty() {
@@ -408,62 +530,49 @@ pub fn inspect(
     crate::loader::check_project_script_budget(project_path)?;
     let project = crate::loader::load_project_full(project_path)?;
     let scripts = crate::loader::gather_project_scripts(project_path);
+    Ok(inspect_loaded(&project, &scripts, filter, limit))
+}
 
+/// Build the CAN picture from one already-loaded project and parsed script
+/// snapshot. This is the entry point for consumers that attach their own load
+/// report, since the returned verdicts and that report can then describe the
+/// same loaded snapshot instead of two independent loads.
+pub fn inspect_loaded(
+    project: &Project,
+    scripts: &[ParsedScript],
+    filter: Option<&str>,
+    limit: usize,
+) -> CanOutcome {
     // Registered DBC objects. A DBC appears twice — `DBC.<Name>` from the
     // `.m1prj` and bare `<Name>` from the `.m1dbc` — so unify by leaf name while
     // keeping every spelling for the `Init`-call match.
-    let mut dbc_paths: Vec<String> = Vec::new();
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     for s in project.symbols().iter() {
-        if s.classname.as_deref() == Some("BuiltIn.CAN.DBC") {
-            dbc_paths.push(s.path.clone());
-            if let Some(f) = &s.filename {
-                files.entry(leaf(&s.path).to_string()).or_insert(f.clone());
-            }
+        if s.classname.as_deref() == Some("BuiltIn.CAN.DBC")
+            && let Some(f) = &s.filename
+        {
+            files.entry(leaf(&s.path).to_string()).or_insert(f.clone());
         }
     }
-    // Longest path first so `DBC.Dash` is matched before bare `Dash`.
-    dbc_paths.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let dbc_paths = registered_dbc_paths(project);
     let leaves: BTreeSet<String> = dbc_paths.iter().map(|p| leaf(p).to_string()).collect();
 
     // `Init` call sites, keyed by module leaf.
-    let resolve_bus = |arg: &str| classify_bus(arg, &project);
     let mut init_by_module: BTreeMap<String, Vec<CanInitDto>> = BTreeMap::new();
-    for s in &scripts {
-        // An unparseable script's reference shapes are unreliable — skip it,
-        // like the T107 pass does.
-        if !s.cst.syntax_diagnostics().is_empty() {
-            continue;
-        }
-        let mut found = Vec::new();
-        collect_init_calls(s.cst.root(), &dbc_paths, &s.name, &resolve_bus, &mut found);
-        for (module, call) in found {
-            init_by_module.entry(module).or_default().push(call);
-        }
+    let (init_calls, skipped_scripts) = loaded_init_calls(project, scripts);
+    for (module_path, call) in init_calls {
+        init_by_module
+            .entry(leaf(&module_path).to_string())
+            .or_default()
+            .push(call);
     }
 
     // Resolve each module's bus: one agreed argument, or none.
     let mut modules: Vec<CanModuleDto> = Vec::new();
-    // module leaf -> (bus argument, kind, resolved number, calibration-sourced)
-    type BusBinding = (Option<String>, String, Option<i64>, bool);
     let mut bus_of: BTreeMap<String, BusBinding> = BTreeMap::new();
     for name in &leaves {
         let calls = init_by_module.get(name).cloned().unwrap_or_default();
-        let distinct: BTreeSet<&str> = calls.iter().map(|c| c.bus.as_str()).collect();
-        let binding: BusBinding = match distinct.len() {
-            0 => (None, "none".to_string(), None, false),
-            1 => {
-                let call = &calls[0];
-                (
-                    Some(call.bus.clone()),
-                    call.bus_kind.clone(),
-                    call.bus_value,
-                    call.bus_calibrated,
-                )
-            }
-            // Disagreeing `Init` calls: no single bus can be assumed.
-            _ => (None, "conflicting-init".to_string(), None, false),
-        };
+        let binding = binding_from_calls(&calls);
         bus_of.insert(name.clone(), binding.clone());
         let (bus, bus_kind, bus_value, bus_calibrated) = binding;
         modules.push(CanModuleDto {
@@ -533,7 +642,7 @@ pub fn inspect(
         messages.truncate(limit);
     }
 
-    Ok(CanOutcome {
+    CanOutcome {
         modules,
         uninitialised_modules: leaves
             .iter()
@@ -543,8 +652,9 @@ pub fn inspect(
         id_overlaps,
         messages,
         total_messages,
+        skipped_scripts,
         guidance: GUIDANCE.iter().map(|g| g.to_string()).collect(),
-    })
+    }
 }
 
 /// Group messages by CAN id and judge each repeated id against the buses its

@@ -8,13 +8,15 @@
 //! - `writer` — render that model as the text of a standard Vector `.dbc`.
 //! - `roundtrip` — read that text back with a third-party parser, so the
 //!   output is checked by code this repo did not write.
+//! - `runtime` — expose exact M1 CAN identities and bit layouts to in-process
+//!   evaluators without exposing the parser or writer stages themselves.
 //!
-//! Every stage reports failure with [`ExportError`].
+//! Every export stage reports failure with [`ExportError`].
 //!
 //! [`export`] is the entry point the `export` subcommand calls: it runs all four
-//! stages over every pair the repo declares, prints the report, and returns the
-//! [`Outcome`] that becomes the process exit code. The export stage modules stay
-//! private; CAN inspection is also exposed as a library API so `m1-mcp` and
+//! export stages over every pair the repo declares, prints the report, and
+//! returns the [`Outcome`] that becomes the process exit code. The export stage
+//! modules stay private; CAN inspection is also exposed as a library API so `m1-mcp` and
 //! other consumers share exactly the same bus-binding and overlap rules.
 
 use std::fmt;
@@ -25,11 +27,17 @@ mod config;
 mod loader;
 mod m1dbc;
 mod roundtrip;
+mod runtime;
 mod writer;
 
 pub use can::{
     CanIdOverlapDto, CanInitDto, CanMessageDto, CanModuleDto, CanOutcome, CanOverlapMemberDto,
-    inspect,
+    CanSkippedScriptDto, inspect, inspect_loaded,
+};
+pub use m1_typecheck::symbols::CanDirection;
+pub use runtime::{
+    CanDbcSource, CanEndian, CanFrameFormat, CanRuntimeMessage, CanRuntimeModel, CanRuntimeModule,
+    CanRuntimeSignal, runtime_model_loaded,
 };
 
 /// How an export run ended — the CLI's exit-code contract.

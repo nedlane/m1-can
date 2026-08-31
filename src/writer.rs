@@ -214,10 +214,13 @@ mod tests {
     /// per-field tests vary one attribute at a time from.
     fn sig(name: &str, start_bit: u16, length: u16) -> M1Signal {
         M1Signal {
+            source_path: format!("Test.Message.{name}"),
             name: name.to_string(),
+            raw_type: "u32".to_string(),
             start_bit,
             length,
             little_endian: true,
+            endian: "Little".to_string(),
             is_signed: false,
             is_float: false,
             scale: 1.0,
@@ -230,10 +233,13 @@ mod tests {
     /// A standard-frame 8-byte message from an unnamed sender.
     fn msg(name: &str, frame_id: u32, signals: Vec<M1Signal>) -> M1Message {
         M1Message {
+            source_path: format!("Test.{name}"),
             name: name.to_string(),
             frame_id,
             is_extended: false,
+            id_type: "Standard".to_string(),
             dlc: 8,
+            direction: None,
             sender: "Vector__XXX".to_string(),
             signals,
         }
@@ -243,7 +249,10 @@ mod tests {
     /// renders [`M1DbcFile::messages`] and nothing else.
     fn file(messages: Vec<M1Message>) -> M1DbcFile {
         M1DbcFile {
+            module_paths: vec!["Test".to_string()],
             messages,
+            orphan_signal_paths: Vec::new(),
+            duplicate_message_paths: Vec::new(),
             skipped: Vec::new(),
             totals: SourceCounts {
                 total_messages: 0,
