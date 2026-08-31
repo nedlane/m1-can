@@ -771,14 +771,21 @@ fn runtime_signal(
 }
 
 fn message_format(source_path: &str, message: &M1Message) -> Result<CanFrameFormat, String> {
-    match message.id_type.as_str() {
-        "Standard" => Ok(CanFrameFormat::Standard),
-        "Extended" => Ok(CanFrameFormat::Extended),
+    let (format, maximum) = match message.id_type.as_str() {
+        "Standard" => (CanFrameFormat::Standard, 0x7FF),
+        "Extended" => (CanFrameFormat::Extended, 0x1FFF_FFFF),
         other => Err(format!(
             "CAN source `{source_path}` message `{}` has unsupported IdType `{other}`",
             message.source_path
-        )),
+        ))?,
+    };
+    if message.frame_id > maximum {
+        return Err(format!(
+            "CAN source `{source_path}` message `{}` has CANId 0x{:X}, outside the {} identifier range 0x0..=0x{maximum:X}",
+            message.source_path, message.frame_id, message.id_type
+        ));
     }
+    Ok(format)
 }
 
 fn message_direction(

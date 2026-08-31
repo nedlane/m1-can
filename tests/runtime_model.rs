@@ -320,6 +320,35 @@ fn runtime_model_refuses_unknown_endian_and_out_of_module_paths() {
 }
 
 #[test]
+fn runtime_model_rejects_ids_outside_the_declared_frame_format() {
+    let (project, scripts) = snapshot("DBC.Vehicle Network.Init(2);\n");
+    for (id_type, can_id, maximum) in [
+        ("Standard", "800", "0x7FF"),
+        ("Extended", "20000000", "0x1FFFFFFF"),
+    ] {
+        let invalid = DBC.replace(
+            "CANId=\"4B3\" IdType=\"Extended\"",
+            &format!("CANId=\"{can_id}\" IdType=\"{id_type}\""),
+        );
+        let error = runtime_model_loaded(
+            &project,
+            &scripts,
+            &[CanDbcSource {
+                path: "Vehicle Network.m1dbc",
+                bytes: invalid.as_bytes(),
+            }],
+        )
+        .expect_err("a frame identifier must fit its declared format");
+        assert!(
+            error.contains(&format!(
+                "CANId 0x{can_id}, outside the {id_type} identifier range 0x0..={maximum}"
+            )),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn runtime_model_rejects_comparable_stale_augmented_layout() {
     let dir = tempfile::tempdir().unwrap();
     let dbc_path = dir.path().join("Vehicle Network.m1dbc");
