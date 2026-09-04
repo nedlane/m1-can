@@ -44,8 +44,20 @@ const DEFAULT_NODE: &str = "Vector__XXX";
 /// that let a caller verify the two add up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct M1DbcFile {
+    /// Exact `Name` attributes of the `BuiltIn.CAN.DBC` components. Export does
+    /// not need them, but the runtime model uses them as the source identities
+    /// that messages and signals must sit beneath.
+    pub module_paths: Vec<String>,
     /// Convertible messages in document order, each with its signals attached.
     pub messages: Vec<M1Message>,
+    /// Signals whose exact parent path names no surviving message. The exporter
+    /// continues to drop these as before; the runtime model rejects them because
+    /// silently inventing an owner would corrupt frame layout.
+    pub orphan_signal_paths: Vec<String>,
+    /// Repeated exact message paths. Export preserves the reference writer's
+    /// replace-in-place behaviour, while the runtime model rejects the ambiguous
+    /// identity.
+    pub duplicate_message_paths: Vec<String>,
     /// One human-readable note per dropped component, in document order.
     pub skipped: Vec<String>,
     /// Counts taken by a second, independent walk of the source (see
@@ -75,14 +87,21 @@ pub struct SourceCounts {
 /// A CAN frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct M1Message {
+    /// Exact M1 component path from `Name`, before DBC-writer sanitisation.
+    pub source_path: String,
     /// DBC identifier: the MoTeC name with the file prefix stripped, sanitized.
     pub name: String,
     /// `CANId`, parsed from hexadecimal.
     pub frame_id: u32,
     /// `IdType="Extended"` — a 29-bit rather than 11-bit identifier.
     pub is_extended: bool,
+    /// Effective source frame format (`Standard` when `IdType` is absent).
+    pub id_type: String,
     /// `DLC`, parsed from **decimal**: the frame's length in bytes.
     pub dlc: u8,
+    /// Raw `Transmit` attribute. Runtime conversion accepts only `RX`/`TX` and
+    /// leaves an absent direction unknown.
+    pub direction: Option<String>,
     /// The transmitting node, or `Vector__XXX` when the file names none.
     pub sender: String,
     /// The frame's signals, in document order.
@@ -92,14 +111,20 @@ pub struct M1Message {
 /// A signal within a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct M1Signal {
+    /// Exact M1 component path from `Name`, before DBC-writer sanitisation.
+    pub source_path: String,
     /// DBC identifier: the segment after the last `.`, sanitized.
     pub name: String,
+    /// Effective raw M1 type (`u32` when `Type` is absent or empty).
+    pub raw_type: String,
     /// `StartBit`, parsed from hexadecimal.
     pub start_bit: u16,
     /// Width in bits, parsed from hexadecimal — always 1 for a `bool`.
     pub length: u16,
     /// `Endian="Little"` (the default, and universal in practice).
     pub little_endian: bool,
+    /// Effective source byte order (`Little` when `Endian` is absent or empty).
+    pub endian: String,
     /// The `Type` begins with `s`.
     pub is_signed: bool,
     /// The `Type` begins with `f`.
@@ -158,9 +183,12 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
 
     // Pass 1: collect. The `<List>` is unordered, so signals are bucketed by the
     // name of the message they claim and attached once every message is known.
+    let mut module_paths = Vec::new();
     let mut messages: Vec<(String, M1Message)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut seen_message_paths: HashSet<&str> = HashSet::new();
     let mut signals: HashMap<String, Vec<M1Signal>> = HashMap::new();
+    let mut duplicate_message_paths = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
     for comp in &components {
@@ -175,21 +203,27 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
                 ));
                 continue;
             }
+            if !seen_message_paths.insert(name) {
+                duplicate_message_paths.push(name.to_string());
+            }
             let props = props_of(*comp, "message", name)?;
             let Some(can_id) = props.attribute("CANId") else {
                 skipped.push(format!("message '{name}' (no CANId)"));
                 continue;
             };
             let message = M1Message {
+                source_path: name.to_string(),
                 name: sanitize(message_local_name(name, file_stem), file_stem),
                 frame_id: parse_hex(can_id, "message", name, "CANId")?,
                 is_extended: props.attribute("IdType").unwrap_or("Standard") == "Extended",
+                id_type: props.attribute("IdType").unwrap_or("Standard").to_string(),
                 dlc: parse_dec(
                     props.attribute("DLC").unwrap_or("8"),
                     "message",
                     name,
                     "DLC",
                 )?,
+                direction: non_empty(props.attribute("Transmit")).map(str::to_string),
                 sender: or_default_node(comp.attribute("Sender")),
                 signals: Vec::new(),
             };
@@ -216,6 +250,9 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
                 .or_default()
                 .push(build_signal(*comp, file_stem)?);
         } else {
+            if classname == "BuiltIn.CAN.DBC" {
+                module_paths.push(name.to_string());
+            }
             // `BuiltIn.CAN.DBC` file metadata, and anything else.
             let what = if classname.is_empty() {
                 "unknown"
@@ -235,10 +272,19 @@ pub fn parse_m1dbc(bytes: &[u8], file_stem: &str) -> Result<M1DbcFile, ExportErr
             m
         })
         .collect();
+    let mut orphan_signal_paths: Vec<String> = signals
+        .into_values()
+        .flatten()
+        .map(|signal| signal.source_path)
+        .collect();
+    orphan_signal_paths.sort();
 
     let totals = count_source(&components);
     Ok(M1DbcFile {
+        module_paths,
         messages,
+        orphan_signal_paths,
+        duplicate_message_paths,
         skipped,
         totals,
     })
@@ -322,7 +368,9 @@ fn build_signal(comp: roxmltree::Node<'_, '_>, file_stem: &str) -> Result<M1Sign
         .unwrap_or("Little");
 
     Ok(M1Signal {
+        source_path: full_name.to_string(),
         name: sanitize(signal_local_name(full_name), file_stem),
+        raw_type: sig_type.to_string(),
         start_bit: parse_hex(
             props.attribute("StartBit").unwrap_or("0"),
             "signal",
@@ -331,6 +379,7 @@ fn build_signal(comp: roxmltree::Node<'_, '_>, file_stem: &str) -> Result<M1Sign
         )?,
         length,
         little_endian: endian == "Little",
+        endian: endian.to_string(),
         is_signed,
         is_float,
         scale: parse_float(props.attribute("Multiplier"), 1.0, full_name, "Multiplier")?,
@@ -517,8 +566,10 @@ mod tests {
     #[test]
     fn keeps_only_the_one_convertible_message_from_the_fixture() {
         let f = sample();
+        assert_eq!(f.module_paths, ["Sample DBC"]);
         assert_eq!(f.messages.len(), 1, "messages: {:?}", f.messages);
         let m = &f.messages[0];
+        assert_eq!(m.source_path, "Sample DBC.Status");
         assert_eq!(
             m.name, "Status",
             "file prefix must be stripped and sanitized"
@@ -529,6 +580,8 @@ mod tests {
             "IdType=\"Standard\" is not an extended frame"
         );
         assert_eq!(m.dlc, 8, "DLC is decimal");
+        assert_eq!(m.id_type, "Standard");
+        assert_eq!(m.direction, None, "absent Transmit stays unknown");
         assert_eq!(
             m.sender, "ECU",
             "Sender lives on the Component, not the Props"
@@ -542,6 +595,7 @@ mod tests {
         assert_eq!(sigs.len(), 2, "signals: {sigs:?}");
 
         let yaw = &sigs[0];
+        assert_eq!(yaw.source_path, "Sample DBC.Status.Yaw Rate");
         assert_eq!(
             yaw.name, "Yaw_Rate",
             "signal name is the segment after the last '.'"
@@ -549,6 +603,8 @@ mod tests {
         assert_eq!(yaw.start_bit, 0);
         assert_eq!(yaw.length, 16, "Length=\"10\" is hexadecimal");
         assert!(yaw.little_endian, "Endian defaults to Little");
+        assert_eq!(yaw.endian, "Little");
+        assert_eq!(yaw.raw_type, "s16");
         assert!(yaw.is_signed, "Type=\"s16\" starts with 's'");
         assert!(!yaw.is_float);
         assert_eq!(yaw.scale, 0.5);
@@ -680,6 +736,8 @@ mod tests {
         assert!(!a.is_signed, "Type=\"\" falls back to u32");
         assert!(!a.is_float);
         assert!(!a.little_endian, "Props Endian=\"Big\"");
+        assert_eq!(a.endian, "Big");
+        assert_eq!(a.raw_type, "u32", "an empty Type takes the u32 default");
         assert_eq!(a.receiver, "Logger");
 
         let b = &m.signals[1];
