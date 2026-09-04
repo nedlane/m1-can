@@ -11,6 +11,16 @@ use std::path::Path;
 use m1_typecheck::parsed::{self, ParsedScript};
 use m1_typecheck::project::Project;
 
+pub struct ScriptLoadFailure {
+    pub path: String,
+    pub error: String,
+}
+
+pub struct GatheredProjectScripts {
+    pub scripts: Vec<ParsedScript>,
+    pub skipped: Vec<ScriptLoadFailure>,
+}
+
 /// Maximum scripts inspected in one project request.
 const MAX_PROJECT_SCRIPTS: usize = 2000;
 
@@ -68,18 +78,33 @@ pub fn load_project_full(project_path: &Path) -> Result<Project, String> {
 /// Parse every `.m1scr` under the project directory, named by file name (the
 /// key the project uses to map a script to its group/function), matching the
 /// CLI's whole-project pass set.
-pub fn gather_project_scripts(project_path: &Path) -> Vec<ParsedScript> {
+pub fn gather_project_scripts(project_path: &Path) -> GatheredProjectScripts {
     let Some(root) = project_path.parent() else {
-        return Vec::new();
+        return GatheredProjectScripts {
+            scripts: Vec::new(),
+            skipped: Vec::new(),
+        };
     };
-    let pairs: Vec<(String, String)> = m1_workspace::find_scripts(root)
-        .iter()
-        .filter_map(|f| {
-            Some((
-                f.file_name()?.to_str()?.to_string(),
-                m1_workspace::read_text(f).ok()?,
-            ))
-        })
-        .collect();
-    parsed::parse_all(&pairs)
+    let mut pairs = Vec::new();
+    let mut skipped = Vec::new();
+    for path in m1_workspace::find_scripts(root) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            skipped.push(ScriptLoadFailure {
+                path: path.to_string_lossy().into_owned(),
+                error: "script file name is not valid UTF-8".to_string(),
+            });
+            continue;
+        };
+        match m1_workspace::read_text(&path) {
+            Ok(source) => pairs.push((name.to_string(), source)),
+            Err(error) => skipped.push(ScriptLoadFailure {
+                path: path.to_string_lossy().into_owned(),
+                error: error.to_string(),
+            }),
+        }
+    }
+    GatheredProjectScripts {
+        scripts: parsed::parse_all(&pairs),
+        skipped,
+    }
 }

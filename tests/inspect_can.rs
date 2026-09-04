@@ -232,6 +232,40 @@ fn can_names_an_excessively_deep_script_skipped_from_init_analysis() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn can_names_a_non_utf8_script_skipped_before_parsing() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let (_dir, project_path) = can_fixture();
+    let invalid_name = OsString::from_vec(b"invalid-\xff.m1scr".to_vec());
+    std::fs::write(
+        project_path
+            .parent()
+            .unwrap()
+            .join("Scripts")
+            .join(invalid_name),
+        "DBC.Alpha.Init(9);\n",
+    )
+    .unwrap();
+
+    let out = m1_can::inspect(&project_path, None, 200).expect("CAN inspection succeeds");
+
+    assert_eq!(out.skipped_scripts.len(), 1);
+    let skipped = &out.skipped_scripts[0];
+    assert!(
+        skipped.script.contains("invalid-"),
+        "the lossy path should still identify the skipped input: {}",
+        skipped.script,
+    );
+    assert!(
+        skipped.reason.contains("not valid UTF-8"),
+        "{}",
+        skipped.reason,
+    );
+}
+
 #[test]
 fn can_binds_each_dbc_module_to_the_bus_its_init_call_names() {
     let (_dir, project) = can_fixture();

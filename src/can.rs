@@ -529,8 +529,23 @@ pub fn inspect(
 ) -> Result<CanOutcome, String> {
     crate::loader::check_project_script_budget(project_path)?;
     let project = crate::loader::load_project_full(project_path)?;
-    let scripts = crate::loader::gather_project_scripts(project_path);
-    Ok(inspect_loaded(&project, &scripts, filter, limit))
+    let gathered = crate::loader::gather_project_scripts(project_path);
+    let mut outcome = inspect_loaded(&project, &gathered.scripts, filter, limit);
+    outcome
+        .skipped_scripts
+        .extend(
+            gathered
+                .skipped
+                .into_iter()
+                .map(|failure| CanSkippedScriptDto {
+                    script: failure.path,
+                    reason: format!("{}; Init calls were not inspected", failure.error),
+                }),
+        );
+    outcome
+        .skipped_scripts
+        .sort_by(|a, b| a.script.cmp(&b.script));
+    Ok(outcome)
 }
 
 /// Build the CAN picture from one already-loaded project and parsed script
