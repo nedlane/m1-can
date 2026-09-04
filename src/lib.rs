@@ -29,7 +29,7 @@ mod writer;
 
 pub use can::{
     CanIdOverlapDto, CanInitDto, CanMessageDto, CanModuleDto, CanOutcome, CanOverlapMemberDto,
-    inspect,
+    CanSkippedScriptDto, inspect, inspect_loaded,
 };
 
 /// How an export run ended — the CLI's exit-code contract.
