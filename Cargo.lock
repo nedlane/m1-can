@@ -252,13 +252,13 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "m1-can"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "can-dbc",
  "clap",
  "m1-core",
  "m1-typecheck",
- "m1-workspace 0.14.0",
+ "m1-workspace 0.14.1",
  "roxmltree",
  "schemars",
  "serde",
@@ -302,8 +302,8 @@ dependencies = [
 
 [[package]]
 name = "m1-workspace"
-version = "0.14.0"
-source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.14.0#b9ca8691ff203fe5fc5f5d5fff57c09b9f0b08fe"
+version = "0.14.1"
+source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.14.1#635e81a29fcb4b998af7c2097e8262c741f4f547"
 dependencies = [
  "serde",
  "serde_ignored",
