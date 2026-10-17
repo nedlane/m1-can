@@ -172,6 +172,9 @@ pub struct CanOverlapMemberDto {
 pub struct CanIdOverlapDto {
     pub can_id: u32,
     pub can_id_hex: String,
+    /// Whether this group uses extended 29-bit identifiers. Standard and
+    /// extended frames with the same numeric id are distinct CAN messages.
+    pub extended: bool,
     /// `same-bus` (a real clash), `different-bus` (proven safe — the buses
     /// resolve to different numbers), or `unknown` (at least one bus has no
     /// known value, so nothing is proven).
@@ -371,31 +374,26 @@ fn classify_bus(arg: &str, project: &Project) -> BusArg {
     // A script writes the bus symbol by its tail (`Active Bus`), while the
     // project stores the full path (`Root.CAN.Active Bus`); match either.
     let suffix = format!(".{arg}");
-    let mut kinds: BTreeSet<&'static str> = BTreeSet::new();
-    let mut values: BTreeSet<i64> = BTreeSet::new();
-    let mut is_constant = true;
-    for s in project.symbols().iter() {
-        if s.path == arg || s.path.ends_with(&suffix) {
-            kinds.insert(bus_kind_str(s.kind));
-            if let Some(v) = s.static_value.as_deref().and_then(bus_number) {
-                values.insert(v);
-                is_constant &= s.kind == SymbolKind::Constant;
-            }
+    let mut symbols = project
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.path == arg || symbol.path.ends_with(&suffix));
+    let symbol = match (symbols.next(), symbols.next()) {
+        (Some(symbol), None) => symbol,
+        _ => {
+            return BusArg {
+                kind: "expression".to_string(),
+                ..BusArg::default()
+            };
         }
-    }
-    // More than one symbol answers to this name, or they disagree on a value:
-    // resolve nothing rather than pick one.
-    let kind = match kinds.len() {
-        1 => kinds.into_iter().next().unwrap().to_string(),
-        _ => "expression".to_string(),
     };
-    let value = (values.len() == 1).then(|| *values.iter().next().unwrap());
+    let value = symbol.static_value.as_deref().and_then(bus_number);
     BusArg {
-        kind,
+        kind: bus_kind_str(symbol.kind).to_string(),
         value,
         // A constant is fixed by the project; anything else with a value got it
         // from the current calibration.
-        calibrated: value.is_some() && !is_constant,
+        calibrated: value.is_some() && symbol.kind != SymbolKind::Constant,
     }
 }
 
@@ -675,14 +673,14 @@ pub fn inspect_loaded(
 /// Group messages by CAN id and judge each repeated id against the buses its
 /// messages sit on.
 fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
-    let mut by_id: BTreeMap<u32, Vec<&CanMessageDto>> = BTreeMap::new();
+    let mut by_id: BTreeMap<(u32, bool), Vec<&CanMessageDto>> = BTreeMap::new();
     for m in messages {
         if let Some(id) = m.can_id {
-            by_id.entry(id).or_default().push(m);
+            by_id.entry((id, m.extended)).or_default().push(m);
         }
     }
     let mut out = Vec::new();
-    for (id, group) in by_id {
+    for ((id, extended), group) in by_id {
         if group.len() < 2 {
             continue;
         }
@@ -752,6 +750,7 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
         out.push(CanIdOverlapDto {
             can_id: id,
             can_id_hex: format!("0x{id:X}"),
+            extended,
             verdict: verdict.to_string(),
             bus: shared_bus,
             depends_on_calibration: calibrated,
