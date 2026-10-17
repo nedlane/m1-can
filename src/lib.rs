@@ -196,6 +196,8 @@ fn export_pair(pair: &Pair<'_>) -> Result<Outcome, String> {
     let file = m1dbc::parse_m1dbc(&bytes, pair.source_stem)
         .map_err(|e| format!("{}: {e}", pair.src.display()))?;
     let text = writer::write_dbc(&file);
+    // Reject malformed output before replacing an existing usable export.
+    roundtrip::roundtrip_counts(&text).map_err(|e| format!("{}: {e}", pair.src.display()))?;
 
     let target = match pair.scratch {
         Some(dir) => dir.join(format!("{}.dbc", pair.out_stem)),
