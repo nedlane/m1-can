@@ -522,3 +522,440 @@ fn can_rejects_an_over_budget_project() {
     let err = m1_can::inspect(&dir.path().join("Project.m1prj"), None, 200).unwrap_err();
     assert!(err.contains("exceeds"), "unexpected error: {err}");
 }
+
+#[test]
+fn ambiguous_bus_symbols_remain_unknown_in_both_loaded_apis() {
+    for (first, second) in [
+        (
+            r#"Classname="BuiltIn.Constant" Name="Root.One.Bus"><Props Type="s32" Value="1""#,
+            r#"Classname="BuiltIn.Parameter" Name="Root.Two.Bus"><Props Type="s32""#,
+        ),
+        (
+            r#"Classname="BuiltIn.Parameter" Name="Root.One.Bus"><Props Type="s32""#,
+            r#"Classname="BuiltIn.Parameter" Name="Root.Two.Bus"><Props Type="s32""#,
+        ),
+        (
+            r#"Classname="BuiltIn.Constant" Name="Root.One.Bus"><Props Type="s32" Value="1""#,
+            r#"Classname="BuiltIn.Constant" Name="Root.Two.Bus"><Props Type="s32" Value="1""#,
+        ),
+        (
+            r#"Classname="BuiltIn.Constant" Name="Root.One.Bus"><Props Type="s32" Value="1""#,
+            r#"Classname="BuiltIn.Constant" Name="Root.Two.Bus"><Props Type="s32" Value="2""#,
+        ),
+    ] {
+        let (_dir, project_path) = can_fixture();
+        let xml = std::fs::read_to_string(&project_path).unwrap();
+        std::fs::write(
+            &project_path,
+            xml.replace(
+                "</List>",
+                &format!(
+                    "<Component {first}/></Component><Component {second}/></Component></List>"
+                ),
+            ),
+        )
+        .unwrap();
+        let (project, _) = load_can_snapshot(&project_path);
+        let scripts = m1_typecheck::parsed::parse_all(&[(
+            "CAN.CAN Init.m1scr".into(),
+            "DBC.Alpha.Init(Bus); DBC.Beta.Init(Bus);".into(),
+        )]);
+        let out = m1_can::inspect_loaded(&project, &scripts, None, 200);
+        let overlap = out
+            .id_overlaps
+            .iter()
+            .find(|item| item.can_id == 133)
+            .unwrap();
+        assert_eq!(overlap.verdict, "unknown");
+        for module in out
+            .modules
+            .iter()
+            .filter(|module| ["Alpha", "Beta"].contains(&module.name.as_str()))
+        {
+            assert_eq!(module.bus_value, None);
+            assert_eq!(module.bus_kind, "expression");
+            assert!(!module.bus_calibrated);
+        }
+        let source_bytes: Vec<_> = m1_workspace::find_dbc_files(project_path.parent().unwrap())
+            .into_iter()
+            .map(|path| {
+                let relative = path
+                    .strip_prefix(project_path.parent().unwrap())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (relative, std::fs::read(path).unwrap())
+            })
+            .collect();
+        let sources: Vec<_> = source_bytes
+            .iter()
+            .map(|(path, bytes)| m1_can::CanDbcSource { path, bytes })
+            .collect();
+        let runtime = m1_can::runtime_model_loaded(&project, &scripts, &sources).unwrap();
+        assert!(
+            runtime
+                .modules
+                .iter()
+                .filter(|module| ["Alpha", "Beta"].contains(&module.path.as_str()))
+                .all(|module| module.bus_value.is_none() && module.bus_kind == "expression")
+        );
+    }
+}
+
+#[test]
+fn standard_and_extended_ids_form_separate_overlap_groups() {
+    let (_dir, project_path) = can_fixture();
+    let dbc_dir = project_path.parent().unwrap().join("dbc");
+    std::fs::write(
+        dbc_dir.join("Alpha.m1dbc"),
+        m1dbc("Alpha", &[("Standard", 0x123), ("Extended", 0x123)]).replacen(
+            "CANId=\"123\" DLC",
+            "CANId=\"123\" IdType=\"Extended\" DLC",
+            1,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dbc_dir.join("Beta.m1dbc"),
+        m1dbc("Beta", &[("Standard", 0x123)]),
+    )
+    .unwrap();
+    let (project, scripts) = load_can_snapshot(&project_path);
+    let out = m1_can::inspect_loaded(&project, &scripts, Some("does not match"), 1);
+    let overlaps: Vec<_> = out
+        .id_overlaps
+        .iter()
+        .filter(|item| item.can_id == 0x123)
+        .collect();
+    assert_eq!(overlaps.len(), 1);
+    assert!(!overlaps[0].extended);
+    assert_eq!(overlaps[0].messages.len(), 2);
+    let beta = m1dbc("Beta", &[("Standard", 0x123), ("Extended", 0x123)]).replacen(
+        "CANId=\"123\" DLC",
+        "CANId=\"123\" IdType=\"Extended\" DLC",
+        1,
+    );
+    std::fs::write(dbc_dir.join("Beta.m1dbc"), beta).unwrap();
+    let (project, scripts) = load_can_snapshot(&project_path);
+    let out = m1_can::inspect_loaded(&project, &scripts, None, 200);
+    let overlaps: Vec<_> = out
+        .id_overlaps
+        .iter()
+        .filter(|item| item.can_id == 0x123)
+        .collect();
+    assert_eq!(overlaps.len(), 2);
+    assert_ne!(overlaps[0].extended, overlaps[1].extended);
+    assert!(overlaps.iter().all(|item| item.messages.len() == 2));
+}
+
+#[test]
+fn malformed_dbc_cannot_yield_a_successful_partial_cli_report() {
+    let (_dir, project_path) = can_fixture();
+    let bad = project_path.parent().unwrap().join("dbc/Broken.m1dbc");
+    std::fs::write(&bad, "<broken>").unwrap();
+    let error = m1_can::inspect(&project_path, None, 200).unwrap_err();
+    assert!(error.contains("Broken.m1dbc"), "{error}");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_m1-can"))
+        .arg("inspect")
+        .arg("--project")
+        .arg(&project_path)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Broken.m1dbc"));
+    assert!(result.stdout.is_empty());
+}
+
+/// Check the public inspection and evaluator model against the same snapshot.
+fn assert_scoped_bus(
+    project: &m1_typecheck::project::Project,
+    scripts: &[m1_typecheck::parsed::ParsedScript],
+    sources: &[m1_can::CanDbcSource<'_>],
+    expected_kind: &str,
+    expected_value: Option<i64>,
+) {
+    for script in scripts {
+        assert!(
+            script.cst.syntax_diagnostics().is_empty(),
+            "{}",
+            script.name
+        );
+    }
+    let inspection = m1_can::inspect_loaded(project, scripts, None, 200);
+    assert!(inspection.skipped_scripts.is_empty());
+    let alpha = inspection
+        .modules
+        .iter()
+        .find(|m| m.name == "Alpha")
+        .unwrap();
+    assert!(alpha.initialised);
+    assert_eq!(alpha.bus_kind, expected_kind);
+    assert_eq!(alpha.bus_value, expected_value);
+    assert!(!alpha.bus_calibrated);
+    let overlap = inspection
+        .id_overlaps
+        .iter()
+        .find(|o| o.can_id == 133)
+        .unwrap();
+    assert_eq!(
+        overlap.verdict,
+        if expected_value.is_some() {
+            "different-bus"
+        } else {
+            "unknown"
+        }
+    );
+    let runtime = m1_can::runtime_model_loaded(project, scripts, sources).unwrap();
+    assert!(runtime.skipped_scripts.is_empty());
+    let alpha_runtime = runtime.modules.iter().find(|m| m.path == "Alpha").unwrap();
+    assert_eq!(alpha_runtime.bus_kind, alpha.bus_kind);
+    assert_eq!(alpha_runtime.bus_value, alpha.bus_value);
+    assert_eq!(alpha_runtime.bus_calibrated, alpha.bus_calibrated);
+    assert!(alpha_runtime.initialised);
+}
+
+#[test]
+fn scoped_bus_arguments_never_guess_shadowed_project_constants() {
+    let (_dir, project_path) = can_fixture();
+    let xml = std::fs::read_to_string(&project_path).unwrap().replace(
+        "</List>",
+        r#"<Component Classname="BuiltIn.Constant" Name="Root.CAN.Bus"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.CAN.In.Input"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.CAN.Out"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.FuncUserParam" Name="Root.CAN.Parameter" Filename="CAN.Parameter.m1scr"><Signature ReturnType="s32"><Params><Param Name="Input" Type="s32" Attrs="0"/></Params></Signature></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.CAN.Calculate"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.CAN.Bus 1"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.CAN.Active 1 Bus"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.CAN.Bus 1 Part 1"><Props Type="s32" Value="1"/></Component>
+</List>"#,
+    );
+    std::fs::write(&project_path, xml).unwrap();
+    let (project, _) = load_can_snapshot(&project_path);
+    let bytes: Vec<_> = m1_workspace::find_dbc_files(project_path.parent().unwrap())
+        .into_iter()
+        .map(|p| {
+            (
+                format!("dbc/{}", p.file_name().unwrap().to_str().unwrap()),
+                std::fs::read(p).unwrap(),
+            )
+        })
+        .collect();
+    let sources: Vec<_> = bytes
+        .iter()
+        .map(|(path, bytes)| m1_can::CanDbcSource { path, bytes })
+        .collect();
+    for (name, body, kind, value) in [
+        ("unshadowed", "DBC.Alpha.Init(Bus);", "constant", Some(1)),
+        (
+            "interpolated local concrete read",
+            "expand (N = 1 to 1) { local Bus $(N) = 2; DBC.Alpha.Init(Bus 1); }",
+            "expression",
+            None,
+        ),
+        (
+            "interpolated local template read",
+            "expand (N = 1 to 1) { local Bus $(N) = 2; DBC.Alpha.Init(Bus $(N)); }",
+            "expression",
+            None,
+        ),
+        (
+            "interpolated local forward read",
+            "DBC.Alpha.Init(Bus 1); expand (N = 1 to 1) { local Bus $(N) = 2; }",
+            "expression",
+            None,
+        ),
+        (
+            "interpolated local suffix",
+            "expand (N = 1 to 1) { local Active $(N) Bus = 2; DBC.Alpha.Init(Active 1 Bus); }",
+            "expression",
+            None,
+        ),
+        (
+            "interpolated local repeated variable",
+            "expand (N = 1 to 1) { local Bus $(N) Part $(N) = 2; DBC.Alpha.Init(Bus 1 Part 1); }",
+            "expression",
+            None,
+        ),
+        (
+            "interpolated unrelated local",
+            "expand (N = 1 to 1) { local Other $(N) = 2; DBC.Alpha.Init(Bus 1); }",
+            "constant",
+            Some(1),
+        ),
+        (
+            "interpolated suffix does not match",
+            "expand (N = 1 to 1) { local Bus $(N) Suffix = 2; DBC.Alpha.Init(Bus 1); }",
+            "constant",
+            Some(1),
+        ),
+        (
+            "interpolated local qualified control",
+            "expand (N = 1 to 1) { local Bus $(N) = 2; DBC.Alpha.Init(Root.CAN.Bus 1); }",
+            "constant",
+            Some(1),
+        ),
+        (
+            "interpolated local literal control",
+            "expand (N = 1 to 1) { local Bus $(N) = 2; DBC.Alpha.Init(1); }",
+            "literal",
+            Some(1),
+        ),
+        (
+            "local",
+            "local Bus = 2; DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "typed",
+            "local <Integer> Bus = 2; DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "static",
+            "static local Bus = 2; DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "uninitialized",
+            "local Bus; DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "mutated",
+            "local Bus = 1; Bus = 2; DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "self_initializer",
+            "local Bus = DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "forward",
+            "DBC.Alpha.Init(Bus); local Bus = 2;",
+            "expression",
+            None,
+        ),
+        (
+            "block",
+            "{ local Bus = 2; } DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "conditional",
+            "if (True) { local Bus = 2; } DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "sibling_branch",
+            "if (False) { local Bus = 2; } else { DBC.Alpha.Init(Bus); }",
+            "expression",
+            None,
+        ),
+        (
+            "when",
+            "when (1) { is (1) { local Bus = 2; } } DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "expand",
+            "expand (Bus = 1 to 2) { DBC.Alpha.Init(Bus); }",
+            "expression",
+            None,
+        ),
+        (
+            "after_expand",
+            "expand (Bus = 1 to 2) { ; } DBC.Alpha.Init(Bus);",
+            "expression",
+            None,
+        ),
+        (
+            "qualified",
+            "local Bus = 2; DBC.Alpha.Init(Root.CAN.Bus);",
+            "constant",
+            Some(1),
+        ),
+        (
+            "relative_qualified",
+            "local Bus = 2; DBC.Alpha.Init(CAN.Bus);",
+            "constant",
+            Some(1),
+        ),
+        (
+            "local_root",
+            "local Root = 2; DBC.Alpha.Init(Root.CAN.Bus);",
+            "constant",
+            Some(1),
+        ),
+        (
+            "unrelated_local",
+            "local Other = 2; DBC.Alpha.Init(Bus);",
+            "constant",
+            Some(1),
+        ),
+        (
+            "multiword",
+            "local Active Bus = 2; DBC.Alpha.Init(Active Bus);",
+            "expression",
+            None,
+        ),
+        ("input", "DBC.Alpha.Init(In.Input);", "expression", None),
+        ("output", "DBC.Alpha.Init(Out);", "expression", None),
+        ("library", "DBC.Alpha.Init(Calculate);", "expression", None),
+        ("arithmetic", "DBC.Alpha.Init(Bus + 1);", "expression", None),
+    ] {
+        let scripts = m1_typecheck::parsed::parse_all(&[(
+            "CAN.CAN Init.m1scr".into(),
+            format!("{body} DBC.Beta.Init(2);"),
+        )]);
+        eprintln!("scope case: {name}");
+        assert_scoped_bus(&project, &scripts, &sources, kind, value);
+    }
+    // Script-local bindings must not leak into a neighboring function. Equal
+    // source text from the two functions must not hide a conflicting binding.
+    for reversed in [false, true] {
+        let mut sources_text = vec![
+            (
+                "CAN.CAN Init.m1scr".into(),
+                "DBC.Alpha.Init(Bus); DBC.Beta.Init(2);".into(),
+            ),
+            (
+                "Other.m1scr".into(),
+                "local Bus = 2; DBC.Alpha.Init(Bus);".into(),
+            ),
+        ];
+        if reversed {
+            sources_text.reverse();
+        }
+        let scripts = m1_typecheck::parsed::parse_all(&sources_text);
+        assert_scoped_bus(&project, &scripts, &sources, "conflicting-init", None);
+    }
+    let scripts = m1_typecheck::parsed::parse_all(&[
+        (
+            "CAN.CAN Init.m1scr".into(),
+            "DBC.Alpha.Init(Bus); DBC.Beta.Init(2);".into(),
+        ),
+        ("Other.m1scr".into(), "local Bus = 2;".into()),
+    ]);
+    assert_scoped_bus(&project, &scripts, &sources, "constant", Some(1));
+    let scripts = m1_typecheck::parsed::parse_all(&[(
+        "CAN.Parameter.m1scr".into(),
+        "DBC.Alpha.Init(In.Input); DBC.Beta.Init(2);".into(),
+    )]);
+    assert_scoped_bus(&project, &scripts, &sources, "expression", None);
+    // A unique suffix outside the script's actual group is not a binding.
+    let scripts = m1_typecheck::parsed::parse_all(&[(
+        "Other.m1scr".into(),
+        "DBC.Alpha.Init(Bus); DBC.Beta.Init(2);".into(),
+    )]);
+    assert_scoped_bus(&project, &scripts, &sources, "expression", None);
+}

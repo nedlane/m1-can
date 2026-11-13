@@ -12,10 +12,11 @@
 //! independent of the writer.
 //!
 //! The counts are of *frames*, so the independent-signal container is excluded
-//! — see [`roundtrip_counts`].
+//! — see [`counts`].
 
 use crate::ExportError;
-use can_dbc::Dbc;
+use crate::m1dbc::M1DbcFile;
+use can_dbc::{ByteOrder, Dbc, SignalExtendedValueType, ValueType};
 
 /// DBC's holding pen for signals that belong to no frame.
 ///
@@ -42,15 +43,101 @@ const INDEPENDENT_SIG_MSG: &str = "VECTOR__INDEPENDENT_SIG_MSG";
 /// [`ExportError::Dbc`] if the text is not a parseable CAN database, carrying
 /// the third-party parser's own diagnosis. A malformed input is never a panic
 /// and never a zero count.
+#[cfg(test)]
 pub fn roundtrip_counts(dbc_text: &str) -> Result<(usize, usize), ExportError> {
-    let dbc = Dbc::try_from(dbc_text).map_err(|e| ExportError::Dbc(e.to_string()))?;
-    Ok(dbc
-        .messages
+    Ok(counts(&read(dbc_text)?))
+}
+
+pub fn read(dbc_text: &str) -> Result<Dbc, ExportError> {
+    Dbc::try_from(dbc_text).map_err(|e| ExportError::Dbc(e.to_string()))
+}
+
+pub fn counts(dbc: &Dbc) -> (usize, usize) {
+    dbc.messages
         .iter()
         .filter(|message| message.name != INDEPENDENT_SIG_MSG)
         .fold((0, 0), |(messages, signals), message| {
             (messages + 1, signals + message.signals.len())
-        }))
+        })
+}
+
+/// Compare the independent reader's model, including fields counts cannot check.
+pub fn verify(dbc: &Dbc, expected: &M1DbcFile) -> Result<(), String> {
+    if dbc.messages.len() != expected.messages.len() {
+        return Err("message count differs".into());
+    }
+    let mut floats = std::collections::HashMap::new();
+    for tag in &dbc.signal_extended_value_type_list {
+        if floats
+            .insert(
+                (tag.message_id.raw(), tag.signal_name.as_str()),
+                tag.signal_extended_value_type,
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate float declaration for '{}'",
+                tag.signal_name
+            ));
+        }
+    }
+    for (actual, message) in dbc.messages.iter().zip(&expected.messages) {
+        let id = message.frame_id | if message.is_extended { 0x8000_0000 } else { 0 };
+        if actual.id.raw() != id
+            || actual.name != message.name
+            || actual.size != u64::from(message.dlc)
+            || actual.transmitter.as_deref().unwrap_or("Vector__XXX") != message.sender
+            || actual.signals.len() != message.signals.len()
+        {
+            return Err(format!("message '{}' differs", message.source_path));
+        }
+        for (read, signal) in actual.signals.iter().zip(&message.signals) {
+            let order = if signal.little_endian {
+                ByteOrder::LittleEndian
+            } else {
+                ByteOrder::BigEndian
+            };
+            let sign = if signal.is_signed {
+                ValueType::Signed
+            } else {
+                ValueType::Unsigned
+            };
+            let receivers: Vec<_> = if signal.receiver == "Vector__XXX" {
+                vec![]
+            } else {
+                vec![signal.receiver.as_str()]
+            };
+            // can-dbc 10 retains quote escapes in strings.
+            let unit = signal.unit.as_deref().unwrap_or("").replace('"', "\\\"");
+            if read.name != signal.name
+                || read.start_bit != u64::from(signal.start_bit)
+                || read.size != u64::from(signal.length)
+                || read.byte_order != order
+                || read.value_type != sign
+                || read.factor != signal.scale
+                || read.offset != signal.offset
+                || read.unit != unit
+                || read.receivers != receivers
+            {
+                return Err(format!("signal '{}' differs", signal.source_path));
+            }
+            let expected_type = match signal.raw_type.as_str() {
+                "f32" => Some(SignalExtendedValueType::IEEEfloat32Bit),
+                "f64" => Some(SignalExtendedValueType::IEEEdouble64bit),
+                _ => None,
+            };
+            if floats.remove(&(id, signal.name.as_str())) != expected_type {
+                return Err(format!(
+                    "float declaration for '{}' differs",
+                    signal.source_path
+                ));
+            }
+        }
+    }
+    if !floats.is_empty() {
+        return Err("unexpected float declarations".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -80,6 +167,36 @@ BO_ 256 Real: 8 ECU
 BO_ 3221225472 VECTOR__INDEPENDENT_SIG_MSG: 0 Vector__XXX
  SG_ Orphan : 0|8@1+ (1,0) [0|0] \"\" Vector__XXX
 ";
+
+    #[test]
+    fn semantic_verification_detects_changes_without_count_differences() {
+        let mut file = parse_m1dbc(SAMPLE, "Sample DBC").unwrap();
+        file.messages[0].signals[0].raw_type = "f32".into();
+        file.messages[0].signals[0].is_float = true;
+        file.messages[0].signals[0].is_signed = false;
+        file.messages[0].signals[0].length = 32;
+        let text = write_dbc(&file);
+        assert!(verify(&read(&text).unwrap(), &file).is_ok());
+        for changed in [
+            text.replace("BO_ 1021", "BO_ 1022"),
+            text.replace("(0.5,-100)", "(0.25,-100)"),
+            text.replace("@1+", "@1-"),
+            text.replace("SIG_VALTYPE_ 1021 Yaw_Rate : 1;", ""),
+            text.replace(
+                "SIG_VALTYPE_ 1021 Yaw_Rate : 1;",
+                "SIG_VALTYPE_ 1021 Yaw_Rate : 2;",
+            ),
+            text.replace(
+                "SIG_VALTYPE_ 1021 Yaw_Rate : 1;",
+                "SIG_VALTYPE_ 1021 Ready : 1;",
+            ),
+            format!("{text}SIG_VALTYPE_ 1021 Yaw_Rate : 1;\n"),
+        ] {
+            let parsed = read(&changed).unwrap();
+            assert_eq!(counts(&parsed), counts(&read(&text).unwrap()));
+            assert!(verify(&parsed, &file).is_err(), "{changed}");
+        }
+    }
 
     #[test]
     fn the_fixture_render_reads_back_as_one_message_and_two_signals() {

@@ -10,6 +10,7 @@ const PROJECT: &str = r#"<?xml version="1.0"?>
  <Component Classname="BuiltIn.Constant" Name="Root.CAN.Active Bus">
   <Props Type="s32" Value="2"/>
  </Component>
+ <Component Classname="BuiltIn.FuncUser" Name="Root.CAN.Init" Filename="CAN Init.m1scr"/>
  <Component Classname="BuiltIn.CAN.DBCRoot" Name="DBC"/>
  <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Vehicle Network"/>
 </Project>"#;

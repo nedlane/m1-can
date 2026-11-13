@@ -22,12 +22,106 @@
 //! The result is UTF-8 with LF line endings. Encoding it and putting it on disk
 //! belongs to the caller.
 
+use crate::ExportError;
 use crate::m1dbc::{M1DbcFile, M1Message, M1Signal};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// DBC's placeholder for "no node named". It is not a real node, so it is never
 /// declared on the `BU_` line.
 const DEFAULT_NODE: &str = "Vector__XXX";
+
+/// Refuse layouts and identities that cannot be exported without losing data.
+pub fn validate_export(file: &M1DbcFile) -> Result<(), ExportError> {
+    let mut names = HashMap::new();
+    let mut ids = HashMap::new();
+    for message in &file.messages {
+        if let Some(first) = names.insert(&message.name, &message.source_path) {
+            return Err(ExportError::Invalid(format!(
+                "messages '{first}' and '{}' both export as '{}'",
+                message.source_path, message.name
+            )));
+        }
+        if let Some(first) = ids.insert(
+            (message.frame_id, message.is_extended),
+            &message.source_path,
+        ) {
+            return Err(ExportError::Invalid(format!(
+                "messages '{first}' and '{}' share {} CANId 0x{:X} in one export",
+                message.source_path, message.id_type, message.frame_id
+            )));
+        }
+        validate_node(&message.sender, &message.source_path, "Sender")?;
+        let mut signal_names = HashMap::new();
+        for signal in &message.signals {
+            if let Some(first) = signal_names.insert(&signal.name, &signal.source_path) {
+                return Err(ExportError::Invalid(format!(
+                    "signals '{first}' and '{}' both export as '{}'",
+                    signal.source_path, signal.name
+                )));
+            }
+            validate_node(&signal.receiver, &signal.source_path, "Receivers")?;
+            let unit = signal.unit.as_deref().unwrap_or("");
+            if unit.ends_with('\\') || unit.chars().any(char::is_control) {
+                return Err(ExportError::Invalid(format!(
+                    "signal '{}': Unit contains an unsupported trailing backslash or control character",
+                    signal.source_path
+                )));
+            }
+            let expected_float_width = match signal.raw_type.as_str() {
+                "f32" => Some(32),
+                "f64" => Some(64),
+                _ => None,
+            };
+            if expected_float_width.is_some_and(|width| signal.length != width) {
+                return Err(ExportError::Invalid(format!(
+                    "signal '{}': Type {} requires {} bits, got {}",
+                    signal.source_path,
+                    signal.raw_type,
+                    expected_float_width.unwrap(),
+                    signal.length
+                )));
+            }
+            let limit = u32::from(message.dlc) * 8;
+            let mut bit = u32::from(signal.start_bit);
+            if signal.length == 0 {
+                return Err(ExportError::Invalid(format!(
+                    "signal '{}': Length must be nonzero",
+                    signal.source_path
+                )));
+            }
+            for _ in 0..signal.length {
+                if bit >= limit {
+                    return Err(ExportError::Invalid(format!(
+                        "signal '{}': bit layout exceeds message '{}' DLC {}",
+                        signal.source_path, message.source_path, message.dlc
+                    )));
+                }
+                bit = if signal.little_endian {
+                    bit + 1
+                } else if bit % 8 == 0 {
+                    bit + 15
+                } else {
+                    bit - 1
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_node(node: &str, path: &str, attr: &str) -> Result<(), ExportError> {
+    let mut chars = node.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(ExportError::Invalid(format!(
+            "component '{path}': {attr} {node:?} is not a single DBC node identifier"
+        )));
+    }
+    Ok(())
+}
 
 /// Everything ahead of the `BU_` line: the version stub, the `NS_` table of
 /// keywords a reader should expect, and the empty bit-timing section.
@@ -145,7 +239,7 @@ fn signal_line(signal: &M1Signal) -> String {
         if signal.is_signed { '-' } else { '+' },
         signal.scale,
         signal.offset,
-        signal.unit.as_deref().unwrap_or(""),
+        signal.unit.as_deref().unwrap_or("").replace('"', "\\\""),
         signal.receiver
     )
 }
@@ -165,11 +259,8 @@ fn emitted_id(message: &M1Message) -> u32 {
 
 /// The `SIG_VALTYPE_` code for a signal, or `None` when it needs no such line.
 ///
-/// DBC defines exactly two extended value types — 1 for IEEE single precision,
-/// 2 for double — so only 32- and 64-bit floats can be declared. MoTeC can name
-/// a width DBC cannot express (`Type="f16"`); such a signal is written as an
-/// ordinary signal with no `SIG_VALTYPE_` rather than being mislabelled as a
-/// single-precision float, which would silently change how a reader decodes it.
+/// DBC defines 1 for IEEE single precision and 2 for double. Export validation
+/// rejects other float widths before the writer runs.
 fn extended_value_type(signal: &M1Signal) -> Option<u8> {
     if !signal.is_float {
         return None;
@@ -452,21 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn a_float_of_an_unrepresentable_width_gets_no_sig_valtype_line() {
-        // DBC knows only IEEE single and double; a MoTeC `Type="f16"` has no
-        // extended value type, so it is written as a plain integer signal
-        // rather than guessing one.
-        let mut half = sig("Half", 0, 16);
-        half.is_float = true;
-        let out = write_dbc(&file(vec![msg("A", 1, vec![half])]));
-        assert!(
-            !out.contains("SIG_VALTYPE_ 1 "),
-            "no extended value type for a 16-bit float: {out}"
-        );
-        assert!(
-            out.contains(" SG_ Half : 0|16@1+ (1,0) [0|0] \"\" Vector__XXX\n"),
-            "the signal itself is still written: {out}"
-        );
+    fn a_float_of_an_unrepresentable_width_is_rejected() {
+        let mut single = sig("Single", 0, 16);
+        single.raw_type = "f32".into();
+        single.is_float = true;
+        let error = validate_export(&file(vec![msg("A", 1, vec![single])])).unwrap_err();
+        assert!(error.to_string().contains("f32 requires 32 bits"));
     }
 
     #[test]

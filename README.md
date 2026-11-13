@@ -5,7 +5,7 @@ databases as standard Vector `.dbc` files, and tell CI when an export is stale.
 
 A `.m1dbc` declares messages but carries no bus. `m1-can inspect` combines the
 databases with the project's `DBC.<Name>.Init(<bus>)` calls and calibration to
-classify repeated IDs as real same-bus clashes, safe different-bus reuse, or
+classify repeated frame identities as same-bus overlaps, safe different-bus reuse, or
 unknown. `m1-can export` renders each database as a standard Vector `.dbc`
 so Vector tools, SavvyCAN, python-can and the rest of the paddock can open the
 same database. The `.m1dbc` stays the source of truth; the `.dbc` is a generated
@@ -51,12 +51,21 @@ authoritative layout snapshot.
 
 ## CAN topology and overlap verdicts
 
-CAN identifiers are scoped to a bus. Two modules may legitimately reuse an ID
+CAN identifiers are scoped to a bus and frame format. Standard and extended
+frames with the same numeric ID are distinct. A same-bus overlap requires
+review of the messages' intended use; it does not alone prove two transmitters
+will collide. Two modules may legitimately reuse an ID
 when their `Init` calls bind them to different buses. `inspect` resolves literal
 buses, project constants, and parameter values from `parameters.m1cfg`, and
 marks verdicts that depend on calibration because a retune can change them.
 Uninitialised modules and unresolved expressions remain `unknown` rather than
-being guessed.
+being guessed. Local and `expand` names anywhere in a function remain unknown,
+including forward references and declarations in branches. Function inputs also
+remain unknown. Bare names that may match an interpolated local name also remain
+unknown; this check does not enumerate expansion bounds. Literal buses and fully
+qualified project paths remain distinguishable. Project-symbol arguments must resolve in the script's scope and
+have a unique project identity for their written spelling; equal argument text
+alone does not establish a shared binding.
 
 ## Configuration
 
@@ -190,3 +199,22 @@ GPL-3.0-or-later — see [LICENSE](LICENSE).
 Independent, community-built open-source tooling for the MoTeC® M1 script
 language. Not affiliated with, authorised, or endorsed by MoTeC Pty Ltd.
 "MoTeC" and "M1" are trademarks of MoTeC Pty Ltd.
+
+Exports are staged and read back before replacing a destination. A failed
+parse, validation or verification leaves the previous export intact. Export
+validation rejects unknown type, byte-order and frame-format names, invalid
+identifier ranges, non-finite scaling, zero-width or out-of-payload fields,
+float type/width mismatches and ambiguous output names or frame identities.
+The independent readback compares layout, names, scaling, nodes, units and
+float declarations as well as counts. Quoted units are escaped; units with
+control characters or trailing backslashes and unsupported node names are
+rejected with source context. Each node attribute currently names one node.
+
+DLC remains a decimal payload-byte count, including values above eight. Integer
+types may use narrower transmitted fields. Overlapping signal views and the
+legacy last-definition rule for repeated exact message paths remain unchanged.
+Ordinary orphan signals are omitted and named in the skipped report.
+
+Project inspection fails if a discovered DBC cannot be loaded. Consumers of
+`inspect_loaded` own their load report and snapshot completeness; this API does
+not reread files or discover omitted inputs.

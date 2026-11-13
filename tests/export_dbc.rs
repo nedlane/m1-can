@@ -53,6 +53,51 @@ fn export_dbc(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn failed_candidates_preserve_existing_exports_and_create_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("m1-tools.toml"), CONFIG).unwrap();
+    let source = root.path().join("src/Sample DBC.m1dbc");
+    let destination = root.path().join("dbc/Sample.dbc");
+    for invalid in [
+        "<broken>",
+        r#"<ComponentStream><List><Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Frame" Sender="Engine ECU"><Props CANId="123"/></Component></List></ComponentStream>"#,
+        r#"<ComponentStream><List><Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Frame"><Props CANId="123"/></Component><Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.Frame.Value"><Props Multiplier="NaN"/></Component></List></ComponentStream>"#,
+    ] {
+        std::fs::write(&source, FIXTURE).unwrap();
+        assert!(export_dbc(root.path(), &[]).status.success());
+        let previous = std::fs::read(&destination).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&source, invalid).unwrap();
+        for args in [&[][..], &["--check"][..]] {
+            let result = export_dbc(root.path(), args);
+            assert_eq!(result.status.code(), Some(2), "{result:?}");
+            assert_eq!(std::fs::read(&destination).unwrap(), previous, "{invalid}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&destination)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        std::fs::remove_file(&destination).unwrap();
+        let result = export_dbc(root.path(), &[]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(!destination.exists(), "{invalid}");
+    }
+}
+
+#[test]
 fn generation_writes_the_export_and_reports_the_counts() {
     let root = sample_repo("generate");
 
@@ -99,7 +144,7 @@ fn generation_writes_the_export_and_reports_the_counts() {
 }
 
 #[test]
-fn a_parseable_count_mismatch_preserves_the_existing_export() {
+fn injected_frame_in_unit_is_rejected_before_replacing_the_export() {
     let root = sample_repo("preflight-count-mismatch");
     let source = r#"<ComponentStream><List>
 <Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Status">
@@ -120,15 +165,16 @@ fn a_parseable_count_mismatch_preserves_the_existing_export() {
     let out = export_dbc(&root, &[]);
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "a parseable count mismatch must exit 1: {}\n{}",
+        Some(2),
+        "invalid unit must fail before generating an export: {}\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(std::fs::read(&target).unwrap(), previous);
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("round-trip mismatch vs written .dbc"),
-        "the independent parser must detect the injected extra frame"
+        String::from_utf8_lossy(&out.stderr)
+            .contains("Unit contains an unsupported trailing backslash or control character"),
+        "input validation must reject the injected extra frame"
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -423,4 +469,208 @@ fn a_missing_source_exits_2() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+fn source_with(message: &str, signal: &str, unit: &str) -> String {
+    format!(
+        r#"<ComponentStream><List>
+<Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Frame"><Props {message}/></Component>
+<Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.Frame.Value"><Props {signal}><Locale><Default Unit="{unit}"/></Locale></Props></Component>
+</List></ComponentStream>"#
+    )
+}
+
+#[test]
+fn malformed_values_and_unrepresentable_layouts_never_replace_the_export() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("m1-tools.toml"), CONFIG).unwrap();
+    let source = root.path().join("src/Sample DBC.m1dbc");
+    let destination = root.path().join("dbc/Sample.dbc");
+    std::fs::write(&source, FIXTURE).unwrap();
+    assert!(export_dbc(root.path(), &[]).status.success());
+    let previous = std::fs::read(&destination).unwrap();
+    let message = r#"CANId="123" DLC="8""#;
+    let signal = r#"Type="u32" StartBit="0" Length="10""#;
+    let mut cases = vec![
+        "<other/>".to_string(),
+        "<ComponentStream/>".to_string(),
+        "<ComponentStream><Lsist/></ComponentStream>".to_string(),
+    ];
+    for attrs in [
+        r#"CANId="800""#,
+        r#"CANId="80000123""#,
+        r#"CANId="20000000" IdType="Extended""#,
+        r#"CANId="123" IdType="Extened""#,
+        r#"CANId="123" DLC="0""#,
+    ] {
+        cases.push(source_with(attrs, signal, ""));
+    }
+    for attrs in [
+        r#"Type="f16" Length="10""#,
+        r#"Type="f32" Length="10""#,
+        r#"Type="f64" Length="20""#,
+        r#"Type="int8""#,
+        r#"Endian="Littel""#,
+        r#"Length="0""#,
+        r#"StartBit="3F" Length="2""#,
+        r#"StartBit="38" Length="2" Endian="Big""#,
+        r#"Multiplier="NaN""#,
+        r#"Offset="inf""#,
+    ] {
+        cases.push(source_with(message, attrs, ""));
+    }
+    for unit in ["tail\\", "&#10;", "&#13;", "&#9;"] {
+        cases.push(source_with(message, signal, unit));
+    }
+    for invalid in cases {
+        std::fs::write(&source, &invalid).unwrap();
+        for args in [&[][..], &["--check"][..]] {
+            let result = export_dbc(root.path(), args);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "accepted {invalid}: {result:?}"
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("Sample DBC.m1dbc"));
+            assert_eq!(std::fs::read(&destination).unwrap(), previous, "{invalid}");
+            assert!(!String::from_utf8_lossy(&result.stdout).contains("in sync         : yes"));
+        }
+    }
+}
+
+#[test]
+fn valid_layout_boundaries_and_escaped_units_remain_exportable() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("m1-tools.toml"), CONFIG).unwrap();
+    for (message, signal, unit) in [
+        (
+            r#"CANId="7FF" DLC="8""#,
+            r#"StartBit="3F" Length="1""#,
+            "in&quot;",
+        ),
+        (
+            r#"CANId="1FFFFFFF" IdType="Extended" DLC="8""#,
+            r#"StartBit="3F" Length="8" Endian="Big""#,
+            "a\\b",
+        ),
+        (
+            r#"CANId="123" DLC="10""#,
+            r#"StartBit="7" Length="10" Endian="Big" Type="s32""#,
+            "a\\&quot;b",
+        ),
+        (
+            r#"CANId="123""#,
+            r#"Type="f32" Length="20" Multiplier="0" Offset="-1""#,
+            "",
+        ),
+        (r#"CANId="123""#, r#"Type="f64" Length="40""#, ""),
+        (
+            r#"CANId="123""#,
+            r#"Type="bool" StartBit="3F" Length="FFFF""#,
+            "",
+        ),
+        (
+            r#"CANId="123""#,
+            r#"Type="u32" Length="C" Multiplier="-2""#,
+            "",
+        ),
+    ] {
+        std::fs::write(
+            root.path().join("src/Sample DBC.m1dbc"),
+            source_with(message, signal, unit),
+        )
+        .unwrap();
+        for args in [&[][..], &["--check"][..]] {
+            let result = export_dbc(root.path(), args);
+            assert!(
+                result.status.success(),
+                "{message} {signal} {unit}: {result:?}"
+            );
+        }
+    }
+    for empty in [
+        "<ComponentStream><List/></ComponentStream>",
+        "<DBC><ComponentStream><List/></ComponentStream></DBC>",
+    ] {
+        std::fs::write(root.path().join("src/Sample DBC.m1dbc"), empty).unwrap();
+        assert!(export_dbc(root.path(), &[]).status.success());
+    }
+}
+
+#[test]
+fn rejected_pair_does_not_prevent_other_exports() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::create_dir(root.path().join("dbc")).unwrap();
+    std::fs::write(
+        root.path().join("m1-tools.toml"),
+        "[dbc]\nsrc_dir=\"src\"\nout_dir=\"dbc\"\n[dbc.exports]\nA=\"A\"\nB=\"B\"\nC=\"C\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/A.m1dbc"), FIXTURE).unwrap();
+    std::fs::write(root.path().join("src/B.m1dbc"), "<other/>").unwrap();
+    std::fs::write(root.path().join("src/C.m1dbc"), FIXTURE).unwrap();
+    std::fs::write(root.path().join("dbc/B.dbc"), "previous").unwrap();
+    let result = export_dbc(root.path(), &[]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(root.path().join("dbc/A.dbc").is_file());
+    assert!(root.path().join("dbc/C.dbc").is_file());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("dbc/B.dbc")).unwrap(),
+        "previous"
+    );
+}
+
+#[test]
+fn ambiguous_export_names_and_frame_identities_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("m1-tools.toml"), CONFIG).unwrap();
+    for (first, second) in [("A B", "A_B"), ("A-B", "A B"), ("A__B", "A_B"), ("!", "?")] {
+        for signals in [false, true] {
+            let components = if signals {
+                format!(
+                    r#"<Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Frame"><Props CANId="1"/></Component>
+<Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.Frame.{first}"><Props Length="8"/></Component>
+<Component Classname="BuiltIn.CAN.Signal" Name="Sample DBC.Frame.{second}"><Props StartBit="8" Length="8"/></Component>"#
+                )
+            } else {
+                format!(
+                    r#"<Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.{first}"><Props CANId="1"/></Component>
+<Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.{second}"><Props CANId="2"/></Component>"#
+                )
+            };
+            std::fs::write(
+                root.path().join("src/Sample DBC.m1dbc"),
+                format!("<ComponentStream><List>{components}</List></ComponentStream>"),
+            )
+            .unwrap();
+            let result = export_dbc(root.path(), &[]);
+            assert_eq!(result.status.code(), Some(2), "{result:?}");
+            let error = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                error.contains(first) && error.contains(second) && error.contains("both export as"),
+                "{error}"
+            );
+            assert!(!root.path().join("dbc/Sample.dbc").exists());
+        }
+    }
+    for extended in [false, true] {
+        let format = if extended { "Extended" } else { "Standard" };
+        let source = format!(
+            r#"<ComponentStream><List>
+<Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.One"><Props CANId="123"/></Component>
+<Component Classname="BuiltIn.CAN.Message" Name="Sample DBC.Two"><Props CANId="123" IdType="{format}"/></Component>
+</List></ComponentStream>"#
+        );
+        std::fs::write(root.path().join("src/Sample DBC.m1dbc"), source).unwrap();
+        let result = export_dbc(root.path(), &[]);
+        assert_eq!(
+            result.status.code(),
+            Some(if extended { 0 } else { 2 }),
+            "{result:?}"
+        );
+    }
 }

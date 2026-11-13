@@ -12,7 +12,7 @@
 //!
 //! This module reconstructs that picture for an agent: every DBC module with
 //! its `Init` call sites and bus argument, every message with its id and
-//! resolved bus, and every repeated id classified as `same-bus` (a real clash),
+//! resolved bus, and every repeated id classified as `same-bus` (shared frame identity requiring review),
 //! `different-bus` (provably fine) or `unknown` (the bus argument is not a
 //! static value — typically a calibratable Parameter — so nothing can be
 //! proven either way).
@@ -20,11 +20,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use m1_core::{Kind, Node};
+use m1_core::{Field, Kind, Node};
 use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::project::Project;
+use m1_typecheck::resolve::{Resolution, Scope, resolve};
 use m1_typecheck::symbols::{CanDirection, SymbolKind};
 use m1_typecheck::typer::path_text;
+use m1_typecheck::types::ValueType;
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -37,12 +39,12 @@ const GUIDANCE: [&str; 7] = [
     "A `.m1dbc` has no CAN bus of its own: a script must bind it with `DBC.<Name>.Init(<bus>)` \
      (conventionally one `CAN Init` script). A DBC that is used but never initialised is M1 Build \
      Error 1375 (m1-typecheck T107).",
-    "CAN identifiers are per bus. Two messages sharing an id do NOT conflict when their modules \
+    "CAN identifiers are per bus and frame format. Two messages sharing an id do NOT conflict when their modules \
      were initialised on different buses — check `bus`/`bus_value` before ever reporting a clash.",
     "A bus argument that names a symbol is resolved to a number where the project knows one: a \
      constant's `.m1prj` `Value`, or a parameter's cell in `parameters.m1cfg`. That number is in \
      `bus_value`.",
-    "`verdict: \"different-bus\"` means proven safe, `\"same-bus\"` a real clash, and \
+    "`verdict: \"different-bus\"` means proven safe, `\"same-bus\"` shared frame identity requiring review, and \
      `\"unknown\"` that at least one bus has no known value (uninitialised, or a symbol the \
      project carries no value for) — say so, do not guess.",
     "`depends_on_calibration: true` means the verdict rests on a parameter's value in \
@@ -171,11 +173,10 @@ pub struct CanOverlapMemberDto {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CanIdOverlapDto {
     pub can_id: u32,
-    pub can_id_hex: String,
-    /// Whether this group uses extended 29-bit identifiers. Standard and
-    /// extended frames with the same numeric id are distinct CAN messages.
+    /// Whether this overlap concerns extended rather than standard frames.
     pub extended: bool,
-    /// `same-bus` (a real clash), `different-bus` (proven safe — the buses
+    pub can_id_hex: String,
+    /// `same-bus` (shared frame identity requiring review), `different-bus` (proven safe — the buses
     /// resolve to different numbers), or `unknown` (at least one bus has no
     /// known value, so nothing is proven).
     pub verdict: String,
@@ -357,7 +358,7 @@ fn bus_number(text: &str) -> Option<i64> {
 /// Classify a bus argument: a literal number, else the symbol it names — whose
 /// kind and statically-known value (a constant's `.m1prj` `Value`, a parameter's
 /// `parameters.m1cfg` cell) both come from the loaded project model.
-fn classify_bus(arg: &str, project: &Project) -> BusArg {
+fn classify_bus(arg: &str, scope: &Scope<'_>) -> BusArg {
     if arg.is_empty() {
         return BusArg {
             kind: "expression".to_string(),
@@ -371,28 +372,61 @@ fn classify_bus(arg: &str, project: &Project) -> BusArg {
             calibrated: false,
         };
     }
-    // A script writes the bus symbol by its tail (`Active Bus`), while the
-    // project stores the full path (`Root.CAN.Active Bus`); match either.
-    let suffix = format!(".{arg}");
-    let mut symbols = project
-        .symbols()
-        .iter()
-        .filter(|symbol| symbol.path == arg || symbol.path.ends_with(&suffix));
-    let symbol = match (symbols.next(), symbols.next()) {
-        (Some(symbol), None) => symbol,
-        _ => {
-            return BusArg {
-                kind: "expression".to_string(),
-                ..BusArg::default()
-            };
-        }
+    // shortcut: interpolation bounds are not evaluated here; matching local-name
+    // prefixes/suffixes stay unknown until concrete expansion analysis is needed.
+    let may_be_generated_local = !arg.contains('.')
+        && scope.locals.keys().any(|name| {
+            name.split_once("$(")
+                .and_then(|(prefix, rest)| {
+                    rest.rsplit_once(')').map(|(_, suffix)| {
+                        arg.len() >= prefix.len() + suffix.len()
+                            && arg.starts_with(prefix)
+                            && arg.ends_with(suffix)
+                    })
+                })
+                .unwrap_or(false)
+        });
+    if may_be_generated_local {
+        return BusArg {
+            kind: "expression".into(),
+            ..BusArg::default()
+        };
+    }
+    let Resolution::Symbol(resolved) = resolve(arg, scope) else {
+        return BusArg {
+            kind: "expression".into(),
+            ..BusArg::default()
+        };
     };
+    let symbols = scope.project.expect("a resolved project symbol").symbols();
+    let exact: Vec<_> = symbols.iter().filter(|symbol| symbol.path == arg).collect();
+    let suffix = format!(".{arg}");
+    let candidates = if exact.is_empty() {
+        symbols
+            .iter()
+            .filter(|symbol| symbol.path.ends_with(&suffix))
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    let [symbol] = candidates.as_slice() else {
+        return BusArg {
+            kind: "expression".into(),
+            ..BusArg::default()
+        };
+    };
+    // Keep global identity uniqueness: DTOs retain source spelling, including
+    // when comparing unvalued symbols and calls from different script groups.
+    if symbol.path != resolved.path {
+        return BusArg {
+            kind: "expression".into(),
+            ..BusArg::default()
+        };
+    }
     let value = symbol.static_value.as_deref().and_then(bus_number);
     BusArg {
-        kind: bus_kind_str(symbol.kind).to_string(),
+        kind: bus_kind_str(symbol.kind).into(),
         value,
-        // A constant is fixed by the project; anything else with a value got it
-        // from the current calibration.
         calibrated: value.is_some() && symbol.kind != SymbolKind::Constant,
     }
 }
@@ -435,7 +469,6 @@ pub(crate) fn loaded_init_calls_for_paths(
     let mut dbc_paths = dbc_paths.to_vec();
     dbc_paths.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     dbc_paths.dedup();
-    let resolve_bus = |arg: &str| classify_bus(arg, project);
     let mut found = Vec::new();
     let mut skipped_scripts = Vec::new();
     for script in scripts {
@@ -473,6 +506,30 @@ pub(crate) fn loaded_init_calls_for_paths(
             });
             continue;
         }
+        let mut scope = Scope {
+            locals: Default::default(),
+            group: project.group_for_script(&script.name),
+            project: Some(project),
+            fn_symbol: project.function_symbol_for_script(&script.name),
+        };
+        // shortcut: whole-function locals include forward, conditional and expand
+        // declarations; use positional flow analysis only when proving their values.
+        // Forward local reads are T105 errors, not evidence for a project constant.
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            let name = match node.kind() {
+                Kind::LocalDeclaration => node.child_by_field(Field::Name),
+                Kind::ExpandStatement => node.child_by_field(Field::Variable),
+                _ => None,
+            };
+            if let Some(name) = name {
+                scope
+                    .locals
+                    .insert(normalise(name.text()), ValueType::Unknown);
+            }
+            pending.extend(node.named_children());
+        }
+        let resolve_bus = |arg: &str| classify_bus(arg, &scope);
         collect_init_calls(root, &dbc_paths, &script.name, &resolve_bus, &mut found);
     }
     skipped_scripts.sort_by(|a, b| a.script.cmp(&b.script));
@@ -485,7 +542,17 @@ pub(crate) type BusBinding = (Option<String>, String, Option<i64>, bool);
 /// Collapse one module's Init calls into its single usable bus binding. Calls
 /// that disagree keep the module initialised but deliberately unbound.
 pub(crate) fn binding_from_calls(calls: &[CanInitDto]) -> BusBinding {
-    let distinct: BTreeSet<&str> = calls.iter().map(|call| call.bus.as_str()).collect();
+    let distinct: BTreeSet<_> = calls
+        .iter()
+        .map(|call| {
+            (
+                &call.bus,
+                &call.bus_kind,
+                call.bus_value,
+                call.bus_calibrated,
+            )
+        })
+        .collect();
     match distinct.len() {
         0 => (None, "none".to_string(), None, false),
         1 => {
@@ -550,6 +617,8 @@ pub fn inspect(
 /// snapshot. This is the entry point for consumers that attach their own load
 /// report, since the returned verdicts and that report can then describe the
 /// same loaded snapshot instead of two independent loads.
+/// The caller owns snapshot completeness, including reporting any sources omitted
+/// during loading. This function does not reread project files.
 pub fn inspect_loaded(
     project: &Project,
     scripts: &[ParsedScript],
@@ -728,7 +797,7 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
             (
                 "same-bus",
                 format!(
-                    "two or more messages with this id are on the same bus — a real CAN id clash{caveat}"
+                    "two or more messages share this frame identity and bus; review their intended use{caveat}"
                 ),
             )
         } else if undecidable {
@@ -749,8 +818,8 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
         };
         out.push(CanIdOverlapDto {
             can_id: id,
-            can_id_hex: format!("0x{id:X}"),
             extended,
+            can_id_hex: format!("0x{id:X}"),
             verdict: verdict.to_string(),
             bus: shared_bus,
             depends_on_calibration: calibrated,
@@ -770,4 +839,33 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bus_resolution_prefers_exact_identity_and_rejects_ambiguous_suffixes() {
+        let project = Project::from_xml(r#"<MoTeCM1BuildSession><Project><ComponentStream><List>
+<Component Classname="BuiltIn.Constant" Name="Bus"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.Other.Bus"><Props Type="s32" Value="2"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.One.Port"><Props Type="s32" Value="1"/></Component>
+<Component Classname="BuiltIn.Constant" Name="Root.Two.Port"><Props Type="s32" Value="1"/></Component>
+</List></ComponentStream></Project></MoTeCM1BuildSession>"#).unwrap();
+        let scope = Scope {
+            locals: Default::default(),
+            group: None,
+            project: Some(&project),
+            fn_symbol: None,
+        };
+        assert_eq!(classify_bus("Bus", &scope).value, Some(1));
+        assert_eq!(classify_bus("Root.Other.Bus", &scope).value, Some(2));
+        for arg in ["Port", "Missing"] {
+            let bus = classify_bus(arg, &scope);
+            assert_eq!(bus.kind, "expression");
+            assert_eq!(bus.value, None);
+            assert!(!bus.calibrated);
+        }
+    }
 }

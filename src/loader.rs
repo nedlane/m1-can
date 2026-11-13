@@ -48,8 +48,8 @@ pub fn check_project_script_budget(project_path: &Path) -> Result<(), String> {
 
 /// Load `project_path` (`Project.m1prj`) and layer in the discovered
 /// `parameters.m1cfg` (parameter types/units) and every `.m1dbc` under the
-/// project directory (CAN signal types/ranges). A malformed `.m1dbc` is skipped
-/// (kept non-fatal, like the CLI) rather than blanking the whole model.
+/// project directory (CAN signal types/ranges). A source load error prevents a
+/// successful topology report from silently omitting part of the project.
 pub fn load_project_full(project_path: &Path) -> Result<Project, String> {
     let mut p = Project::load(project_path).map_err(|e| format!("failed to load project: {e}"))?;
 
@@ -69,8 +69,8 @@ pub fn load_project_full(project_path: &Path) -> Result<Project, String> {
             .unwrap_or(&dbc)
             .to_string_lossy()
             .into_owned();
-        // A malformed/unreadable DBC must not blank the model — skip just it.
-        let _ = p.augment_dbc(&dbc, &rel);
+        p.augment_dbc(&dbc, &rel)
+            .map_err(|error| format!("CAN source '{}': {error}", dbc.display()))?;
     }
     Ok(p)
 }

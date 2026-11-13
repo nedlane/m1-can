@@ -32,7 +32,6 @@ m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.1" }
 m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.52.0" }
 
-[dev-dependencies]
 tempfile = "3"
 
 [profile.release]
